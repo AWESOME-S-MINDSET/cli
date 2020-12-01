@@ -133,21 +133,28 @@ func listRun(opts *ListOptions) error {
 		return err
 	}
 
+	err = opts.IO.StartPager()
+	if err != nil {
+		return err
+	}
+	defer opts.IO.StopPager()
+
 	if opts.IO.IsStdoutTTY() {
 		hasFilters := opts.State != "open" || len(opts.Labels) > 0 || opts.BaseBranch != "" || opts.Assignee != ""
 		title := shared.ListHeader(ghrepo.FullName(baseRepo), "pull request", len(listResult.PullRequests), listResult.TotalCount, hasFilters)
-		fmt.Fprintf(opts.IO.ErrOut, "\n%s\n\n", title)
+		fmt.Fprintf(opts.IO.Out, "\n%s\n\n", title)
 	}
 
+	cs := opts.IO.ColorScheme()
 	table := utils.NewTablePrinter(opts.IO)
 	for _, pr := range listResult.PullRequests {
 		prNum := strconv.Itoa(pr.Number)
 		if table.IsTTY() {
 			prNum = "#" + prNum
 		}
-		table.AddField(prNum, nil, shared.ColorFuncForPR(pr))
+		table.AddField(prNum, nil, cs.ColorFromString(shared.ColorForPR(pr)))
 		table.AddField(text.ReplaceExcessiveWhitespace(pr.Title), nil, nil)
-		table.AddField(pr.HeadLabel(), nil, utils.Cyan)
+		table.AddField(pr.HeadLabel(), nil, cs.Cyan)
 		if !table.IsTTY() {
 			table.AddField(prStateWithDraft(&pr), nil, nil)
 		}

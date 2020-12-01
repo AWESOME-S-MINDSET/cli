@@ -1,6 +1,7 @@
 package ghinstance
 
 import (
+	"errors"
 	"fmt"
 	"strings"
 )
@@ -42,6 +43,21 @@ func NormalizeHostname(h string) string {
 	return hostname
 }
 
+func HostnameValidator(v interface{}) error {
+	hostname, valid := v.(string)
+	if !valid {
+		return errors.New("hostname is not a string")
+	}
+
+	if len(strings.TrimSpace(hostname)) < 1 {
+		return errors.New("a value is required")
+	}
+	if strings.ContainsRune(hostname, '/') || strings.ContainsRune(hostname, ':') {
+		return errors.New("invalid hostname")
+	}
+	return nil
+}
+
 func GraphQLEndpoint(hostname string) string {
 	if IsEnterprise(hostname) {
 		return fmt.Sprintf("https://%s/api/graphql", hostname)
@@ -54,4 +70,11 @@ func RESTPrefix(hostname string) string {
 		return fmt.Sprintf("https://%s/api/v3/", hostname)
 	}
 	return "https://api.github.com/"
+}
+
+func GistPrefix(hostname string) string {
+	if IsEnterprise(hostname) {
+		return fmt.Sprintf("https://%s/gist/", hostname)
+	}
+	return fmt.Sprintf("https://gist.%s/", hostname)
 }

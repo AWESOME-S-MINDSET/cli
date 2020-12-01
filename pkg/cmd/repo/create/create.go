@@ -18,7 +18,6 @@ import (
 	"github.com/cli/cli/pkg/cmdutil"
 	"github.com/cli/cli/pkg/iostreams"
 	"github.com/cli/cli/pkg/prompt"
-	"github.com/cli/cli/utils"
 	"github.com/spf13/cobra"
 )
 
@@ -111,29 +110,17 @@ func NewCmdCreate(f *cmdutil.Factory, runF func(*CreateOptions) error) *cobra.Co
 
 func createRun(opts *CreateOptions) error {
 	projectDir, projectDirErr := git.ToplevelDir()
-
-	var repoToCreate ghrepo.Interface
-
 	isNameAnArg := false
 	isDescEmpty := opts.Description == ""
 	isVisibilityPassed := false
 
 	if opts.Name != "" {
 		isNameAnArg = true
-		if strings.Contains(opts.Name, "/") {
-			var err error
-			repoToCreate, err = ghrepo.FromFullName(opts.Name)
-			if err != nil {
-				return fmt.Errorf("argument error: %w", err)
-			}
-		} else {
-			repoToCreate = ghrepo.New("", opts.Name)
-		}
 	} else {
 		if projectDirErr != nil {
 			return projectDirErr
 		}
-		repoToCreate = ghrepo.New("", path.Base(projectDir))
+		opts.Name = path.Base(projectDir)
 	}
 
 	enabledFlagCount := 0
@@ -159,7 +146,7 @@ func createRun(opts *CreateOptions) error {
 
 	// Trigger interactive prompt if name is not passed
 	if !isNameAnArg {
-		newName, newDesc, newVisibility, err := interactiveRepoCreate(isDescEmpty, isVisibilityPassed, repoToCreate.RepoName())
+		newName, newDesc, newVisibility, err := interactiveRepoCreate(isDescEmpty, isVisibilityPassed, opts.Name)
 		if err != nil {
 			return err
 		}
@@ -181,6 +168,18 @@ func createRun(opts *CreateOptions) error {
 			}
 			visibility = newVisibility
 		}
+	}
+
+	var repoToCreate ghrepo.Interface
+
+	if strings.Contains(opts.Name, "/") {
+		var err error
+		repoToCreate, err = ghrepo.FromFullName(opts.Name)
+		if err != nil {
+			return fmt.Errorf("argument error: %w", err)
+		}
+	} else {
+		repoToCreate = ghrepo.New("", opts.Name)
 	}
 
 	// Find template repo ID
@@ -246,11 +245,11 @@ func createRun(opts *CreateOptions) error {
 
 		stderr := opts.IO.ErrOut
 		stdout := opts.IO.Out
-		greenCheck := utils.Green("✓")
+		cs := opts.IO.ColorScheme()
 		isTTY := opts.IO.IsStdoutTTY()
 
 		if isTTY {
-			fmt.Fprintf(stderr, "%s Created repository %s on GitHub\n", greenCheck, ghrepo.FullName(repo))
+			fmt.Fprintf(stderr, "%s Created repository %s on GitHub\n", cs.SuccessIcon(), ghrepo.FullName(repo))
 		} else {
 			fmt.Fprintln(stdout, repo.URL)
 		}
@@ -272,7 +271,7 @@ func createRun(opts *CreateOptions) error {
 				return err
 			}
 			if isTTY {
-				fmt.Fprintf(stderr, "%s Added remote %s\n", greenCheck, remoteURL)
+				fmt.Fprintf(stderr, "%s Added remote %s\n", cs.SuccessIcon(), remoteURL)
 			}
 		} else if opts.IO.CanPrompt() {
 			doSetup := createLocalDirectory
@@ -285,14 +284,20 @@ func createRun(opts *CreateOptions) error {
 			if doSetup {
 				path := repo.Name
 
-				gitInit := git.GitCommand("init", path)
+				gitInit, err := git.GitCommand("init", path)
+				if err != nil {
+					return err
+				}
 				gitInit.Stdout = stdout
 				gitInit.Stderr = stderr
 				err = run.PrepareCmd(gitInit).Run()
 				if err != nil {
 					return err
 				}
-				gitRemoteAdd := git.GitCommand("-C", path, "remote", "add", "origin", remoteURL)
+				gitRemoteAdd, err := git.GitCommand("-C", path, "remote", "add", "origin", remoteURL)
+				if err != nil {
+					return err
+				}
 				gitRemoteAdd.Stdout = stdout
 				gitRemoteAdd.Stderr = stderr
 				err = run.PrepareCmd(gitRemoteAdd).Run()
@@ -300,9 +305,10 @@ func createRun(opts *CreateOptions) error {
 					return err
 				}
 
-				fmt.Fprintf(stderr, "%s Initialized repository in './%s/'\n", utils.GreenCheck(), path)
+				fmt.Fprintf(stderr, "%s Initialized repository in './%s/'\n", cs.SuccessIcon(), path)
 			}
 		}
+
 		return nil
 	}
 	fmt.Fprintln(opts.IO.Out, "Discarding...")
@@ -312,14 +318,14 @@ func createRun(opts *CreateOptions) error {
 func interactiveRepoCreate(isDescEmpty bool, isVisibilityPassed bool, repoName string) (string, string, string, error) {
 	qs := []*survey.Question{}
 
-	repoOwnerQuestion := &survey.Question{
-		Name: "repoOwner",
+	repoNameQuestion := &survey.Question{
+		Name: "repoName",
 		Prompt: &survey.Input{
 			Message: "Repository name",
 			Default: repoName,
 		},
 	}
-	qs = append(qs, repoOwnerQuestion)
+	qs = append(qs, repoNameQuestion)
 
 	if isDescEmpty {
 		repoDescriptionQuestion := &survey.Question{
@@ -344,7 +350,7 @@ func interactiveRepoCreate(isDescEmpty bool, isVisibilityPassed bool, repoName s
 	}
 
 	answers := struct {
-		RepoOwner       string
+		RepoName        string
 		RepoDescription string
 		RepoVisibility  string
 	}{}
@@ -355,8 +361,7 @@ func interactiveRepoCreate(isDescEmpty bool, isVisibilityPassed bool, repoName s
 		return "", "", "", err
 	}
 
-	return answers.RepoOwner, answers.RepoDescription, strings.ToUpper(answers.RepoVisibility), nil
-
+	return answers.RepoName, answers.RepoDescription, strings.ToUpper(answers.RepoVisibility), nil
 }
 
 func confirmSubmission(repoName string, repoOwner string, isConfirmFlagPassed *bool) (bool, error) {

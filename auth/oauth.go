@@ -40,6 +40,21 @@ type OAuthFlow struct {
 	TimeSleep        func(time.Duration)
 }
 
+func detectDeviceFlow(statusCode int, values url.Values) (bool, error) {
+	if statusCode == http.StatusUnauthorized || statusCode == http.StatusForbidden ||
+		statusCode == http.StatusNotFound || statusCode == http.StatusUnprocessableEntity ||
+		(statusCode == http.StatusOK && values == nil) ||
+		(statusCode == http.StatusBadRequest && values != nil && values.Get("error") == "unauthorized_client") {
+		return true, nil
+	} else if statusCode != http.StatusOK {
+		if values != nil && values.Get("error_description") != "" {
+			return false, fmt.Errorf("HTTP %d: %s", statusCode, values.Get("error_description"))
+		}
+		return false, fmt.Errorf("error: HTTP %d", statusCode)
+	}
+	return false, nil
+}
+
 // ObtainAccessToken guides the user through the browser OAuth flow on GitHub
 // and returns the OAuth access token upon completion.
 func (oa *OAuthFlow) ObtainAccessToken() (accessToken string, err error) {
@@ -58,27 +73,24 @@ func (oa *OAuthFlow) ObtainAccessToken() (accessToken string, err error) {
 	defer resp.Body.Close()
 
 	var values url.Values
-	bb, err := ioutil.ReadAll(resp.Body)
-	if err != nil {
-		return
-	}
-	if resp.StatusCode == 200 || strings.HasPrefix(resp.Header.Get("Content-Type"), "application/x-www-form-urlencoded") {
+	if strings.Contains(resp.Header.Get("Content-Type"), "application/x-www-form-urlencoded") {
+		var bb []byte
+		bb, err = ioutil.ReadAll(resp.Body)
+		if err != nil {
+			return
+		}
 		values, err = url.ParseQuery(string(bb))
 		if err != nil {
 			return
 		}
 	}
 
-	if resp.StatusCode == 401 || resp.StatusCode == 403 || resp.StatusCode == 404 || resp.StatusCode == 422 ||
-		(resp.StatusCode == 400 && values != nil && values.Get("error") == "unauthorized_client") {
+	if doFallback, err := detectDeviceFlow(resp.StatusCode, values); doFallback {
 		// OAuth Device Flow is not available; continue with OAuth browser flow with a
 		// local server endpoint as callback target
 		return oa.localServerFlow()
-	} else if resp.StatusCode != 200 {
-		if values != nil && values.Get("error_description") != "" {
-			return "", fmt.Errorf("HTTP %d: %s (%s)", resp.StatusCode, values.Get("error_description"), initURL)
-		}
-		return "", fmt.Errorf("error: HTTP %d (%s)", resp.StatusCode, initURL)
+	} else if err != nil {
+		return "", fmt.Errorf("%v (%s)", err, initURL)
 	}
 
 	timeNow := oa.TimeNow
@@ -134,7 +146,7 @@ func (oa *OAuthFlow) deviceFlowPing(tokenURL, deviceCode string) (accessToken st
 		return "", err
 	}
 	defer resp.Body.Close()
-	if resp.StatusCode != 200 {
+	if resp.StatusCode != http.StatusOK {
 		return "", fmt.Errorf("error: HTTP %d (%s)", resp.StatusCode, tokenURL)
 	}
 
@@ -235,7 +247,7 @@ func (oa *OAuthFlow) localServerFlow() (accessToken string, err error) {
 	}
 	defer resp.Body.Close()
 
-	if resp.StatusCode != 200 {
+	if resp.StatusCode != http.StatusOK {
 		err = fmt.Errorf("HTTP %d error while obtaining OAuth access token", resp.StatusCode)
 		return
 	}

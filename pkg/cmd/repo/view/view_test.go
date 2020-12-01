@@ -47,6 +47,14 @@ func TestNewCmdView(t *testing.T) {
 				Web:     true,
 			},
 		},
+		{
+			name: "sets branch",
+			cli:  "-b feat/awesome",
+			wants: ViewOptions{
+				RepoArg: "",
+				Branch:  "feat/awesome",
+			},
+		},
 	}
 
 	for _, tt := range tests {
@@ -80,6 +88,7 @@ func TestNewCmdView(t *testing.T) {
 			assert.NoError(t, err)
 
 			assert.Equal(t, tt.wants.Web, gotOpts.Web)
+			assert.Equal(t, tt.wants.Branch, gotOpts.Branch)
 			assert.Equal(t, tt.wants.RepoArg, gotOpts.RepoArg)
 		})
 	}
@@ -104,9 +113,7 @@ func Test_RepoView_Web(t *testing.T) {
 
 	for _, tt := range tests {
 		reg := &httpmock.Registry{}
-		reg.Register(
-			httpmock.GraphQL(`query RepositoryInfo\b`),
-			httpmock.StringResponse(`{}`))
+		reg.StubRepoInfoResponse("OWNER", "REPO", "main")
 
 		opts := &ViewOptions{
 			Web: true,
@@ -198,6 +205,24 @@ func Test_ViewRun(t *testing.T) {
 
 
 				View this repository on GitHub: https://github.com/jill/valentine
+			`),
+		},
+		{
+			name: "branch arg",
+			opts: &ViewOptions{
+				Branch: "feat/awesome",
+			},
+			stdoutTTY: true,
+			wantOut: heredoc.Doc(`
+				OWNER/REPO
+				social distancing
+
+
+				  # truly cool readme check it out                                            
+
+
+
+				View this repository on GitHub: https://github.com/OWNER/REPO/tree/feat%2Fawesome
 			`),
 		},
 		{

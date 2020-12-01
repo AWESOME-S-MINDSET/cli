@@ -90,7 +90,7 @@ example.com:
 	val, err = config.Get("github.com", "git_protocol")
 	eq(t, err, nil)
 	eq(t, val, "ssh")
-	val, err = config.Get("nonexist.io", "git_protocol")
+	val, err = config.Get("nonexistent.io", "git_protocol")
 	eq(t, err, nil)
 	eq(t, val, "ssh")
 }
@@ -110,14 +110,14 @@ github.com:
 	_, err := ParseConfig("config.yml")
 	assert.Nil(t, err)
 
-	expectedMain := "# What protocol to use when performing git operations. Supported values: ssh, https\ngit_protocol: https\n# What editor gh should run when creating issues, pull requests, etc. If blank, will refer to environment.\neditor:\n# When to interactively prompt. This is a global config that cannot be overriden by hostname. Supported values: enabled, disabled\nprompt: enabled\n# Aliases allow you to create nicknames for gh commands\naliases:\n    co: pr checkout\n"
 	expectedHosts := `github.com:
     user: keiyuri
     oauth_token: "123456"
 `
 
-	assert.Equal(t, expectedMain, mainBuf.String())
 	assert.Equal(t, expectedHosts, hostsBuf.String())
+	assert.NotContains(t, mainBuf.String(), "github.com")
+	assert.NotContains(t, mainBuf.String(), "oauth_token")
 }
 
 func Test_parseConfigFile(t *testing.T) {

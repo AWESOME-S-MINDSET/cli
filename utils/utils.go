@@ -8,7 +8,6 @@ import (
 	"time"
 
 	"github.com/briandowns/spinner"
-	"github.com/charmbracelet/glamour"
 	"github.com/cli/cli/internal/run"
 	"github.com/cli/cli/pkg/browser"
 )
@@ -19,30 +18,14 @@ func OpenInBrowser(url string) error {
 	if err != nil {
 		return err
 	}
-	return run.PrepareCmd(browseCmd).Run()
-}
-
-func RenderMarkdown(text string) (string, error) {
-	// Glamour rendering preserves carriage return characters in code blocks, but
-	// we need to ensure that no such characters are present in the output.
-	text = strings.ReplaceAll(text, "\r\n", "\n")
-
-	renderStyle := glamour.WithStandardStyle("notty")
-	// TODO: make color an input parameter
-	if isColorEnabled() {
-		renderStyle = glamour.WithEnvironmentConfig()
-	}
-
-	tr, err := glamour.NewTermRenderer(
-		renderStyle,
-		// glamour.WithBaseURL(""),  // TODO: make configurable
-		// glamour.WithWordWrap(80), // TODO: make configurable
-	)
+	err = run.PrepareCmd(browseCmd).Run()
 	if err != nil {
-		return "", err
+		browserEnv := browser.FromEnv()
+		if browserEnv != "" {
+			return fmt.Errorf("%w\nNote: check your BROWSER environment variable", err)
+		}
 	}
-
-	return tr.Render(text)
+	return err
 }
 
 func Pluralize(num int, thing string) string {
@@ -89,7 +72,7 @@ func Humanize(s string) string {
 	return strings.Map(h, s)
 }
 
-// We do this so we can stub out the spinner in tests -- it made things really flakey. this is not
+// We do this so we can stub out the spinner in tests -- it made things really flakey. This is not
 // an elegant solution.
 var StartSpinner = func(s *spinner.Spinner) {
 	s.Start()
@@ -113,16 +96,4 @@ func DisplayURL(urlStr string) string {
 		return urlStr
 	}
 	return u.Hostname() + u.Path
-}
-
-func GreenCheck() string {
-	return Green("✓")
-}
-
-func YellowDash() string {
-	return Yellow("-")
-}
-
-func RedX() string {
-	return Red("X")
 }

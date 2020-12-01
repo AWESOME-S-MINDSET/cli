@@ -16,6 +16,7 @@ import (
 	prShared "github.com/cli/cli/pkg/cmd/pr/shared"
 	"github.com/cli/cli/pkg/cmdutil"
 	"github.com/cli/cli/pkg/iostreams"
+	"github.com/cli/cli/pkg/markdown"
 	"github.com/cli/cli/utils"
 	"github.com/spf13/cobra"
 )
@@ -88,10 +89,18 @@ func viewRun(opts *ViewOptions) error {
 		}
 		return utils.OpenInBrowser(openURL)
 	}
-	if opts.IO.IsStdoutTTY() {
-		return printHumanIssuePreview(opts.IO.Out, issue)
-	}
 
+	opts.IO.DetectTerminalTheme()
+
+	err = opts.IO.StartPager()
+	if err != nil {
+		return err
+	}
+	defer opts.IO.StopPager()
+
+	if opts.IO.IsStdoutTTY() {
+		return printHumanIssuePreview(opts.IO, issue)
+	}
 	return printRawIssuePreview(opts.IO.Out, issue)
 }
 
@@ -116,14 +125,16 @@ func printRawIssuePreview(out io.Writer, issue *api.Issue) error {
 	return nil
 }
 
-func printHumanIssuePreview(out io.Writer, issue *api.Issue) error {
+func printHumanIssuePreview(io *iostreams.IOStreams, issue *api.Issue) error {
+	out := io.Out
 	now := time.Now()
 	ago := now.Sub(issue.CreatedAt)
+	cs := io.ColorScheme()
 
 	// Header (Title and State)
-	fmt.Fprintln(out, utils.Bold(issue.Title))
-	fmt.Fprint(out, issueStateTitleWithColor(issue.State))
-	fmt.Fprintln(out, utils.Gray(fmt.Sprintf(
+	fmt.Fprintln(out, cs.Bold(issue.Title))
+	fmt.Fprint(out, issueStateTitleWithColor(cs, issue.State))
+	fmt.Fprintln(out, cs.Gray(fmt.Sprintf(
 		" • %s opened %s • %s",
 		issue.Author.Login,
 		utils.FuzzyAgo(ago),
@@ -133,26 +144,27 @@ func printHumanIssuePreview(out io.Writer, issue *api.Issue) error {
 	// Metadata
 	fmt.Fprintln(out)
 	if assignees := issueAssigneeList(*issue); assignees != "" {
-		fmt.Fprint(out, utils.Bold("Assignees: "))
+		fmt.Fprint(out, cs.Bold("Assignees: "))
 		fmt.Fprintln(out, assignees)
 	}
 	if labels := shared.IssueLabelList(*issue); labels != "" {
-		fmt.Fprint(out, utils.Bold("Labels: "))
+		fmt.Fprint(out, cs.Bold("Labels: "))
 		fmt.Fprintln(out, labels)
 	}
 	if projects := issueProjectList(*issue); projects != "" {
-		fmt.Fprint(out, utils.Bold("Projects: "))
+		fmt.Fprint(out, cs.Bold("Projects: "))
 		fmt.Fprintln(out, projects)
 	}
 	if issue.Milestone.Title != "" {
-		fmt.Fprint(out, utils.Bold("Milestone: "))
+		fmt.Fprint(out, cs.Bold("Milestone: "))
 		fmt.Fprintln(out, issue.Milestone.Title)
 	}
 
 	// Body
 	if issue.Body != "" {
 		fmt.Fprintln(out)
-		md, err := utils.RenderMarkdown(issue.Body)
+		style := markdown.GetStyle(io.TerminalTheme())
+		md, err := markdown.Render(issue.Body, style, "")
 		if err != nil {
 			return err
 		}
@@ -161,12 +173,12 @@ func printHumanIssuePreview(out io.Writer, issue *api.Issue) error {
 	fmt.Fprintln(out)
 
 	// Footer
-	fmt.Fprintf(out, utils.Gray("View this issue on GitHub: %s\n"), issue.URL)
+	fmt.Fprintf(out, cs.Gray("View this issue on GitHub: %s\n"), issue.URL)
 	return nil
 }
 
-func issueStateTitleWithColor(state string) string {
-	colorFunc := prShared.ColorFuncForState(state)
+func issueStateTitleWithColor(cs *iostreams.ColorScheme, state string) string {
+	colorFunc := cs.ColorFromString(prShared.ColorForState(state))
 	return colorFunc(strings.Title(strings.ToLower(state)))
 }
 

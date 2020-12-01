@@ -3,18 +3,21 @@ package create
 import (
 	"bytes"
 	"encoding/json"
+	"fmt"
 	"io/ioutil"
 	"net/http"
 	"os"
-	"path"
 	"reflect"
 	"strings"
 	"testing"
 
+	"github.com/MakeNowJust/heredoc"
 	"github.com/cli/cli/context"
 	"github.com/cli/cli/git"
 	"github.com/cli/cli/internal/config"
 	"github.com/cli/cli/internal/ghrepo"
+	"github.com/cli/cli/internal/run"
+	prShared "github.com/cli/cli/pkg/cmd/pr/shared"
 	"github.com/cli/cli/pkg/cmdutil"
 	"github.com/cli/cli/pkg/httpmock"
 	"github.com/cli/cli/pkg/iostreams"
@@ -56,8 +59,11 @@ func runCommandWithRootDirOverridden(rt http.RoundTripper, remotes context.Remot
 			}
 			return context.Remotes{
 				{
-					Remote: &git.Remote{Name: "origin"},
-					Repo:   ghrepo.New("OWNER", "REPO"),
+					Remote: &git.Remote{
+						Name:     "origin",
+						Resolved: "base",
+					},
+					Repo: ghrepo.New("OWNER", "REPO"),
 				},
 			}, nil
 		},
@@ -97,31 +103,23 @@ func TestPRCreate_nontty_web(t *testing.T) {
 	http := initFakeHTTP()
 	defer http.Verify(t)
 
-	http.StubRepoResponse("OWNER", "REPO")
-	http.StubResponse(200, bytes.NewBufferString(`
-	{ "data": { "repository": { "forks": { "nodes": [
-	] } } } }
-	`))
+	http.StubRepoInfoResponse("OWNER", "REPO", "master")
 
 	cs, cmdTeardown := test.InitCmdStubber()
 	defer cmdTeardown()
 
-	cs.Stub("")                                         // git config --get-regexp (determineTrackingBranch)
-	cs.Stub("")                                         // git show-ref --verify   (determineTrackingBranch)
 	cs.Stub("")                                         // git status
 	cs.Stub("1234567890,commit 0\n2345678901,commit 1") // git log
-	cs.Stub("")                                         // git push
 	cs.Stub("")                                         // browser
 
-	output, err := runCommand(http, nil, "feature", false, `--web`)
+	output, err := runCommand(http, nil, "feature", false, `--web --head=feature`)
 	require.NoError(t, err)
 
 	eq(t, output.String(), "")
 	eq(t, output.Stderr(), "")
 
-	eq(t, len(cs.Calls), 6)
-	eq(t, strings.Join(cs.Calls[4].Args, " "), "git push --set-upstream origin HEAD:feature")
-	browserCall := cs.Calls[5].Args
+	eq(t, len(cs.Calls), 3)
+	browserCall := cs.Calls[2].Args
 	eq(t, browserCall[len(browserCall)-1], "https://github.com/OWNER/REPO/compare/master...feature?expand=1")
 
 }
@@ -140,15 +138,101 @@ func TestPRCreate_nontty_insufficient_flags(t *testing.T) {
 	assert.Equal(t, "", output.String())
 }
 
+func TestPRCreate_recover(t *testing.T) {
+	http := initFakeHTTP()
+	defer http.Verify(t)
+
+	http.StubRepoInfoResponse("OWNER", "REPO", "master")
+	http.Register(
+		httpmock.GraphQL(`query PullRequestForBranch\b`),
+		httpmock.StringResponse(`
+		{ "data": { "repository": { "pullRequests": { "nodes" : [
+		] } } } }
+		`))
+	http.Register(
+		httpmock.GraphQL(`query RepositoryResolveMetadataIDs\b`),
+		httpmock.StringResponse(`
+		{ "data": {
+			"u000": { "login": "jillValentine", "id": "JILLID" },
+			"repository": {},
+			"organization": {}
+		} }
+		`))
+	http.Register(
+		httpmock.GraphQL(`mutation PullRequestCreateRequestReviews\b`),
+		httpmock.GraphQLMutation(`
+		{ "data": { "requestReviews": {
+			"clientMutationId": ""
+		} } }
+	`, func(inputs map[string]interface{}) {
+			eq(t, inputs["userIds"], []interface{}{"JILLID"})
+		}))
+	http.Register(
+		httpmock.GraphQL(`mutation PullRequestCreate\b`),
+		httpmock.GraphQLMutation(`
+		{ "data": { "createPullRequest": { "pullRequest": {
+			"URL": "https://github.com/OWNER/REPO/pull/12"
+		} } } }
+		`, func(input map[string]interface{}) {
+			assert.Equal(t, "recovered title", input["title"].(string))
+			assert.Equal(t, "recovered body", input["body"].(string))
+		}))
+
+	cs, cmdTeardown := test.InitCmdStubber()
+	defer cmdTeardown()
+
+	cs.Stub("")                                         // git status
+	cs.Stub("1234567890,commit 0\n2345678901,commit 1") // git log
+
+	as, teardown := prompt.InitAskStubber()
+	defer teardown()
+	as.Stub([]*prompt.QuestionStub{
+		{
+			Name:    "Title",
+			Default: true,
+		},
+	})
+	as.Stub([]*prompt.QuestionStub{
+		{
+			Name:    "Body",
+			Default: true,
+		},
+	})
+	as.Stub([]*prompt.QuestionStub{
+		{
+			Name:  "confirmation",
+			Value: 0,
+		},
+	})
+
+	tmpfile, err := ioutil.TempFile(os.TempDir(), "testrecover*")
+	assert.NoError(t, err)
+
+	state := prShared.IssueMetadataState{
+		Title:     "recovered title",
+		Body:      "recovered body",
+		Reviewers: []string{"jillValentine"},
+	}
+
+	data, err := json.Marshal(state)
+	assert.NoError(t, err)
+
+	_, err = tmpfile.Write(data)
+	assert.NoError(t, err)
+
+	args := fmt.Sprintf("--recover '%s' -Hfeature", tmpfile.Name())
+
+	output, err := runCommandWithRootDirOverridden(http, nil, "feature", true, args, "")
+	assert.NoError(t, err)
+
+	eq(t, output.String(), "https://github.com/OWNER/REPO/pull/12\n")
+}
+
 func TestPRCreate_nontty(t *testing.T) {
 	http := initFakeHTTP()
 	defer http.Verify(t)
 
-	http.StubRepoResponse("OWNER", "REPO")
-	http.StubResponse(200, bytes.NewBufferString(`
-	{ "data": { "repository": { "forks": { "nodes": [
-	] } } } }
-	`))
+	http.StubRepoInfoResponse("OWNER", "REPO", "master")
 	http.StubResponse(200, bytes.NewBufferString(`
 		{ "data": { "repository": { "pullRequests": { "nodes" : [
 		] } } } }
@@ -162,16 +246,13 @@ func TestPRCreate_nontty(t *testing.T) {
 	cs, cmdTeardown := test.InitCmdStubber()
 	defer cmdTeardown()
 
-	cs.Stub("")                                         // git config --get-regexp (determineTrackingBranch)
-	cs.Stub("")                                         // git show-ref --verify   (determineTrackingBranch)
 	cs.Stub("")                                         // git status
 	cs.Stub("1234567890,commit 0\n2345678901,commit 1") // git log
-	cs.Stub("")                                         // git push
 
-	output, err := runCommand(http, nil, "feature", false, `-t "my title" -b "my body"`)
+	output, err := runCommand(http, nil, "feature", false, `-t "my title" -b "my body" -H feature`)
 	require.NoError(t, err)
 
-	bodyBytes, _ := ioutil.ReadAll(http.Requests[3].Body)
+	bodyBytes, _ := ioutil.ReadAll(http.Requests[2].Body)
 	reqBody := struct {
 		Variables struct {
 			Input struct {
@@ -199,20 +280,30 @@ func TestPRCreate(t *testing.T) {
 	http := initFakeHTTP()
 	defer http.Verify(t)
 
+	http.StubRepoInfoResponse("OWNER", "REPO", "master")
 	http.StubRepoResponse("OWNER", "REPO")
-	http.StubResponse(200, bytes.NewBufferString(`
-	{ "data": { "repository": { "forks": { "nodes": [
-	] } } } }
-	`))
-	http.StubResponse(200, bytes.NewBufferString(`
+	http.Register(
+		httpmock.GraphQL(`query UserCurrent\b`),
+		httpmock.StringResponse(`{"data": {"viewer": {"login": "OWNER"} } }`))
+	http.Register(
+		httpmock.GraphQL(`query PullRequestForBranch\b`),
+		httpmock.StringResponse(`
 		{ "data": { "repository": { "pullRequests": { "nodes" : [
 		] } } } }
-	`))
-	http.StubResponse(200, bytes.NewBufferString(`
+		`))
+	http.Register(
+		httpmock.GraphQL(`mutation PullRequestCreate\b`),
+		httpmock.GraphQLMutation(`
 		{ "data": { "createPullRequest": { "pullRequest": {
 			"URL": "https://github.com/OWNER/REPO/pull/12"
 		} } } }
-	`))
+		`, func(input map[string]interface{}) {
+			assert.Equal(t, "REPOID", input["repositoryId"].(string))
+			assert.Equal(t, "my title", input["title"].(string))
+			assert.Equal(t, "my body", input["body"].(string))
+			assert.Equal(t, "master", input["baseRefName"].(string))
+			assert.Equal(t, "feature", input["headRefName"].(string))
+		}))
 
 	cs, cmdTeardown := test.InitCmdStubber()
 	defer cmdTeardown()
@@ -222,59 +313,209 @@ func TestPRCreate(t *testing.T) {
 	cs.Stub("")                                         // git status
 	cs.Stub("1234567890,commit 0\n2345678901,commit 1") // git log
 	cs.Stub("")                                         // git push
+
+	ask, cleanupAsk := prompt.InitAskStubber()
+	defer cleanupAsk()
+	ask.StubOne(0)
 
 	output, err := runCommand(http, nil, "feature", true, `-t "my title" -b "my body"`)
 	require.NoError(t, err)
 
-	bodyBytes, _ := ioutil.ReadAll(http.Requests[3].Body)
-	reqBody := struct {
-		Variables struct {
-			Input struct {
-				RepositoryID string
-				Title        string
-				Body         string
-				BaseRefName  string
-				HeadRefName  string
-			}
-		}
-	}{}
-	_ = json.Unmarshal(bodyBytes, &reqBody)
-
-	eq(t, reqBody.Variables.Input.RepositoryID, "REPOID")
-	eq(t, reqBody.Variables.Input.Title, "my title")
-	eq(t, reqBody.Variables.Input.Body, "my body")
-	eq(t, reqBody.Variables.Input.BaseRefName, "master")
-	eq(t, reqBody.Variables.Input.HeadRefName, "feature")
-
-	eq(t, output.String(), "https://github.com/OWNER/REPO/pull/12\n")
+	assert.Equal(t, "https://github.com/OWNER/REPO/pull/12\n", output.String())
+	assert.Equal(t, "\nCreating pull request for feature into master in OWNER/REPO\n\n", output.Stderr())
 }
-func TestPRCreate_nonLegacyTemplate(t *testing.T) {
+
+func TestPRCreate_createFork(t *testing.T) {
 	http := initFakeHTTP()
 	defer http.Verify(t)
 
+	http.StubRepoInfoResponse("OWNER", "REPO", "master")
 	http.StubRepoResponse("OWNER", "REPO")
-	http.StubResponse(200, bytes.NewBufferString(`
-	{ "data": { "repository": { "forks": { "nodes": [
-	] } } } }
-	`))
-	http.StubResponse(200, bytes.NewBufferString(`
+	http.Register(
+		httpmock.GraphQL(`query UserCurrent\b`),
+		httpmock.StringResponse(`{"data": {"viewer": {"login": "monalisa"} } }`))
+	http.Register(
+		httpmock.GraphQL(`query PullRequestForBranch\b`),
+		httpmock.StringResponse(`
 		{ "data": { "repository": { "pullRequests": { "nodes" : [
 		] } } } }
-	`))
-	http.StubResponse(200, bytes.NewBufferString(`
+		`))
+	http.Register(
+		httpmock.REST("POST", "repos/OWNER/REPO/forks"),
+		httpmock.StatusStringResponse(201, `
+		{ "node_id": "NODEID",
+		  "name": "REPO",
+		  "owner": {"login": "monalisa"}
+		}
+		`))
+	http.Register(
+		httpmock.GraphQL(`mutation PullRequestCreate\b`),
+		httpmock.GraphQLMutation(`
 		{ "data": { "createPullRequest": { "pullRequest": {
 			"URL": "https://github.com/OWNER/REPO/pull/12"
 		} } } }
-	`))
+		`, func(input map[string]interface{}) {
+			assert.Equal(t, "REPOID", input["repositoryId"].(string))
+			assert.Equal(t, "master", input["baseRefName"].(string))
+			assert.Equal(t, "monalisa:feature", input["headRefName"].(string))
+		}))
 
 	cs, cmdTeardown := test.InitCmdStubber()
 	defer cmdTeardown()
 
-	cs.Stub("")                                         // git config --get-regexp (determineTrackingBranch)
-	cs.Stub("")                                         // git show-ref --verify   (determineTrackingBranch)
+	cs.Stub("") // git config --get-regexp (determineTrackingBranch)
+	cs.Stub("") // git show-ref --verify   (determineTrackingBranch)
+	cs.Stub("") // git status
+	cs.Stub("") // git remote add
+	cs.Stub("") // git push
+
+	ask, cleanupAsk := prompt.InitAskStubber()
+	defer cleanupAsk()
+	ask.StubOne(1)
+
+	output, err := runCommand(http, nil, "feature", true, `-t title -b body`)
+	require.NoError(t, err)
+
+	assert.Equal(t, []string{"git", "remote", "add", "-f", "fork", "https://github.com/monalisa/REPO.git"}, cs.Calls[3].Args)
+	assert.Equal(t, []string{"git", "push", "--set-upstream", "fork", "HEAD:feature"}, cs.Calls[4].Args)
+
+	assert.Equal(t, "https://github.com/OWNER/REPO/pull/12\n", output.String())
+}
+
+func TestPRCreate_pushedToNonBaseRepo(t *testing.T) {
+	remotes := context.Remotes{
+		{
+			Remote: &git.Remote{
+				Name:     "upstream",
+				Resolved: "base",
+			},
+			Repo: ghrepo.New("OWNER", "REPO"),
+		},
+		{
+			Remote: &git.Remote{
+				Name:     "origin",
+				Resolved: "base",
+			},
+			Repo: ghrepo.New("monalisa", "REPO"),
+		},
+	}
+
+	http := initFakeHTTP()
+	defer http.Verify(t)
+
+	http.StubRepoInfoResponse("OWNER", "REPO", "master")
+	http.Register(
+		httpmock.GraphQL(`query PullRequestForBranch\b`),
+		httpmock.StringResponse(`
+		{ "data": { "repository": { "pullRequests": { "nodes" : [
+		] } } } }
+		`))
+	http.Register(
+		httpmock.GraphQL(`mutation PullRequestCreate\b`),
+		httpmock.GraphQLMutation(`
+		{ "data": { "createPullRequest": { "pullRequest": {
+			"URL": "https://github.com/OWNER/REPO/pull/12"
+		} } } }
+		`, func(input map[string]interface{}) {
+			assert.Equal(t, "REPOID", input["repositoryId"].(string))
+			assert.Equal(t, "master", input["baseRefName"].(string))
+			assert.Equal(t, "monalisa:feature", input["headRefName"].(string))
+		}))
+
+	cs, cmdTeardown := run.Stub()
+	defer cmdTeardown(t)
+
+	cs.Register("git status", 0, "")
+	cs.Register(`git config --get-regexp \^branch\\\.feature\\\.`, 1, "") // determineTrackingBranch
+	cs.Register("git show-ref --verify", 0, heredoc.Doc(`
+		deadbeef HEAD
+		deadb00f refs/remotes/upstream/feature
+		deadbeef refs/remotes/origin/feature
+	`)) // determineTrackingBranch
+
+	_, cleanupAsk := prompt.InitAskStubber()
+	defer cleanupAsk()
+
+	output, err := runCommand(http, remotes, "feature", true, `-t title -b body`)
+	require.NoError(t, err)
+
+	assert.Equal(t, "\nCreating pull request for monalisa:feature into master in OWNER/REPO\n\n", output.Stderr())
+	assert.Equal(t, "https://github.com/OWNER/REPO/pull/12\n", output.String())
+}
+
+func TestPRCreate_pushedToDifferentBranchName(t *testing.T) {
+	http := initFakeHTTP()
+	defer http.Verify(t)
+
+	http.StubRepoInfoResponse("OWNER", "REPO", "master")
+	http.Register(
+		httpmock.GraphQL(`query PullRequestForBranch\b`),
+		httpmock.StringResponse(`
+		{ "data": { "repository": { "pullRequests": { "nodes" : [
+		] } } } }
+		`))
+	http.Register(
+		httpmock.GraphQL(`mutation PullRequestCreate\b`),
+		httpmock.GraphQLMutation(`
+		{ "data": { "createPullRequest": { "pullRequest": {
+			"URL": "https://github.com/OWNER/REPO/pull/12"
+		} } } }
+		`, func(input map[string]interface{}) {
+			assert.Equal(t, "REPOID", input["repositoryId"].(string))
+			assert.Equal(t, "master", input["baseRefName"].(string))
+			assert.Equal(t, "my-feat2", input["headRefName"].(string))
+		}))
+
+	cs, cmdTeardown := run.Stub()
+	defer cmdTeardown(t)
+
+	cs.Register("git status", 0, "")
+	cs.Register(`git config --get-regexp \^branch\\\.feature\\\.`, 0, heredoc.Doc(`
+		branch.feature.remote origin
+		branch.feature.merge refs/heads/my-feat2
+	`)) // determineTrackingBranch
+	cs.Register("git show-ref --verify", 0, heredoc.Doc(`
+		deadbeef HEAD
+		deadbeef refs/remotes/origin/my-feat2
+	`)) // determineTrackingBranch
+
+	_, cleanupAsk := prompt.InitAskStubber()
+	defer cleanupAsk()
+
+	output, err := runCommand(http, nil, "feature", true, `-t title -b body`)
+	require.NoError(t, err)
+
+	assert.Equal(t, "\nCreating pull request for my-feat2 into master in OWNER/REPO\n\n", output.Stderr())
+	assert.Equal(t, "https://github.com/OWNER/REPO/pull/12\n", output.String())
+}
+
+func TestPRCreate_nonLegacyTemplate(t *testing.T) {
+	http := initFakeHTTP()
+	defer http.Verify(t)
+
+	http.StubRepoInfoResponse("OWNER", "REPO", "master")
+	http.Register(
+		httpmock.GraphQL(`query PullRequestForBranch\b`),
+		httpmock.StringResponse(`
+		{ "data": { "repository": { "pullRequests": { "nodes" : [
+		] } } } }
+		`))
+	http.Register(
+		httpmock.GraphQL(`mutation PullRequestCreate\b`),
+		httpmock.GraphQLMutation(`
+		{ "data": { "createPullRequest": { "pullRequest": {
+			"URL": "https://github.com/OWNER/REPO/pull/12"
+		} } } }
+		`, func(input map[string]interface{}) {
+			assert.Equal(t, "my title", input["title"].(string))
+			assert.Equal(t, "- commit 1\n- commit 0\n\nFixes a bug and Closes an issue", input["body"].(string))
+		}))
+
+	cs, cmdTeardown := test.InitCmdStubber()
+	defer cmdTeardown()
+
 	cs.Stub("")                                         // git status
 	cs.Stub("1234567890,commit 0\n2345678901,commit 1") // git log
-	cs.Stub("")                                         // git push
 
 	as, teardown := prompt.InitAskStubber()
 	defer teardown()
@@ -283,42 +524,22 @@ func TestPRCreate_nonLegacyTemplate(t *testing.T) {
 			Name:  "index",
 			Value: 0,
 		},
-	})
+	}) // template
 	as.Stub([]*prompt.QuestionStub{
 		{
-			Name:    "body",
+			Name:    "Body",
 			Default: true,
 		},
-	})
+	}) // body
 	as.Stub([]*prompt.QuestionStub{
 		{
 			Name:  "confirmation",
 			Value: 0,
 		},
-	})
+	}) // confirm
 
-	output, err := runCommandWithRootDirOverridden(http, nil, "feature", true, `-t "my title"`, "./fixtures/repoWithNonLegacyPRTemplates")
+	output, err := runCommandWithRootDirOverridden(http, nil, "feature", true, `-t "my title" -H feature`, "./fixtures/repoWithNonLegacyPRTemplates")
 	require.NoError(t, err)
-
-	bodyBytes, _ := ioutil.ReadAll(http.Requests[3].Body)
-	reqBody := struct {
-		Variables struct {
-			Input struct {
-				RepositoryID string
-				Title        string
-				Body         string
-				BaseRefName  string
-				HeadRefName  string
-			}
-		}
-	}{}
-	_ = json.Unmarshal(bodyBytes, &reqBody)
-
-	eq(t, reqBody.Variables.Input.RepositoryID, "REPOID")
-	eq(t, reqBody.Variables.Input.Title, "my title")
-	eq(t, reqBody.Variables.Input.Body, "- commit 1\n- commit 0\n\nFixes a bug and Closes an issue")
-	eq(t, reqBody.Variables.Input.BaseRefName, "master")
-	eq(t, reqBody.Variables.Input.HeadRefName, "feature")
 
 	eq(t, output.String(), "https://github.com/OWNER/REPO/pull/12\n")
 }
@@ -327,15 +548,7 @@ func TestPRCreate_metadata(t *testing.T) {
 	http := initFakeHTTP()
 	defer http.Verify(t)
 
-	http.Register(
-		httpmock.GraphQL(`query RepositoryNetwork\b`),
-		httpmock.StringResponse(httpmock.RepoNetworkStubResponse("OWNER", "REPO", "master", "WRITE")))
-	http.Register(
-		httpmock.GraphQL(`query RepositoryFindFork\b`),
-		httpmock.StringResponse(`
-		{ "data": { "repository": { "forks": { "nodes": [
-		] } } } }
-		`))
+	http.StubRepoInfoResponse("OWNER", "REPO", "master")
 	http.Register(
 		httpmock.GraphQL(`query PullRequestForBranch\b`),
 		httpmock.StringResponse(`
@@ -434,59 +647,12 @@ func TestPRCreate_metadata(t *testing.T) {
 	cs, cmdTeardown := test.InitCmdStubber()
 	defer cmdTeardown()
 
-	cs.Stub("")                                         // git config --get-regexp (determineTrackingBranch)
-	cs.Stub("")                                         // git show-ref --verify   (determineTrackingBranch)
 	cs.Stub("")                                         // git status
 	cs.Stub("1234567890,commit 0\n2345678901,commit 1") // git log
-	cs.Stub("")                                         // git push
 
-	output, err := runCommand(http, nil, "feature", true, `-t TITLE -b BODY -a monalisa -l bug -l todo -p roadmap -m 'big one.oh' -r hubot -r monalisa -r /core -r /robots`)
+	output, err := runCommand(http, nil, "feature", true, `-t TITLE -b BODY -H feature -a monalisa -l bug -l todo -p roadmap -m 'big one.oh' -r hubot -r monalisa -r /core -r /robots`)
 	eq(t, err, nil)
 
-	eq(t, output.String(), "https://github.com/OWNER/REPO/pull/12\n")
-}
-
-func TestPRCreate_withForking(t *testing.T) {
-	http := initFakeHTTP()
-	defer http.Verify(t)
-
-	http.StubRepoResponseWithPermission("OWNER", "REPO", "READ")
-	http.StubResponse(200, bytes.NewBufferString(`
-		{ "data": { "repository": { "forks": { "nodes": [
-		] } } } }
-	`))
-	http.StubResponse(200, bytes.NewBufferString(`
-		{ "data": { "repository": { "pullRequests": { "nodes" : [
-		] } } } }
-	`))
-	http.StubResponse(200, bytes.NewBufferString(`
-		{ "node_id": "NODEID",
-		"name": "REPO",
-		"owner": {"login": "myself"},
-		"clone_url": "http://example.com",
-		"created_at": "2008-02-25T20:21:40Z"
-		}
-	`))
-	http.StubResponse(200, bytes.NewBufferString(`
-		{ "data": { "createPullRequest": { "pullRequest": {
-			"URL": "https://github.com/OWNER/REPO/pull/12"
-		} } } }
-	`))
-
-	cs, cmdTeardown := test.InitCmdStubber()
-	defer cmdTeardown()
-
-	cs.Stub("")                                         // git config --get-regexp (determineTrackingBranch)
-	cs.Stub("")                                         // git show-ref --verify   (determineTrackingBranch)
-	cs.Stub("")                                         // git status
-	cs.Stub("1234567890,commit 0\n2345678901,commit 1") // git log
-	cs.Stub("")                                         // git remote add
-	cs.Stub("")                                         // git push
-
-	output, err := runCommand(http, nil, "feature", true, `-t title -b body`)
-	require.NoError(t, err)
-
-	eq(t, http.Requests[3].URL.Path, "/repos/OWNER/REPO/forks")
 	eq(t, output.String(), "https://github.com/OWNER/REPO/pull/12\n")
 }
 
@@ -494,11 +660,7 @@ func TestPRCreate_alreadyExists(t *testing.T) {
 	http := initFakeHTTP()
 	defer http.Verify(t)
 
-	http.StubRepoResponse("OWNER", "REPO")
-	http.StubResponse(200, bytes.NewBufferString(`
-	{ "data": { "repository": { "forks": { "nodes": [
-	] } } } }
-	`))
+	http.StubRepoInfoResponse("OWNER", "REPO", "master")
 	http.StubResponse(200, bytes.NewBufferString(`
 		{ "data": { "repository": { "pullRequests": { "nodes": [
 			{ "url": "https://github.com/OWNER/REPO/pull/123",
@@ -510,12 +672,11 @@ func TestPRCreate_alreadyExists(t *testing.T) {
 	cs, cmdTeardown := test.InitCmdStubber()
 	defer cmdTeardown()
 
-	cs.Stub("")                                         // git config --get-regexp (determineTrackingBranch)
-	cs.Stub("")                                         // git show-ref --verify   (determineTrackingBranch)
-	cs.Stub("")                                         // git status
-	cs.Stub("1234567890,commit 0\n2345678901,commit 1") // git log
+	cs.Stub("") // git config --get-regexp (determineTrackingBranch)
+	cs.Stub("") // git show-ref --verify   (determineTrackingBranch)
+	cs.Stub("") // git status
 
-	_, err := runCommand(http, nil, "feature", true, ``)
+	_, err := runCommand(http, nil, "feature", true, `-ttitle -bbody -H feature`)
 	if err == nil {
 		t.Fatal("error expected, got nil")
 	}
@@ -524,48 +685,15 @@ func TestPRCreate_alreadyExists(t *testing.T) {
 	}
 }
 
-func TestPRCreate_alreadyExistsDifferentBase(t *testing.T) {
-	http := initFakeHTTP()
-	defer http.Verify(t)
-
-	http.StubRepoResponse("OWNER", "REPO")
-	http.StubResponse(200, bytes.NewBufferString(`
-	{ "data": { "repository": { "forks": { "nodes": [
-	] } } } }
-	`))
-	http.StubResponse(200, bytes.NewBufferString(`
-		{ "data": { "repository": { "pullRequests": { "nodes": [
-			{ "url": "https://github.com/OWNER/REPO/pull/123",
-			  "headRefName": "feature",
-				"baseRefName": "master" }
-		] } } } }
-	`))
-	http.StubResponse(200, bytes.NewBufferString("{}"))
-
-	cs, cmdTeardown := test.InitCmdStubber()
-	defer cmdTeardown()
-
-	cs.Stub("")                                         // git config --get-regexp (determineTrackingBranch)
-	cs.Stub("")                                         // git show-ref --verify   (determineTrackingBranch)
-	cs.Stub("")                                         // git status
-	cs.Stub("1234567890,commit 0\n2345678901,commit 1") // git log
-	cs.Stub("")                                         // git rev-parse
-
-	_, err := runCommand(http, nil, "feature", true, `-BanotherBase -t"cool" -b"nah"`)
-	if err != nil {
-		t.Errorf("got unexpected error %q", err)
-	}
-}
-
 func TestPRCreate_web(t *testing.T) {
 	http := initFakeHTTP()
 	defer http.Verify(t)
 
+	http.StubRepoInfoResponse("OWNER", "REPO", "master")
 	http.StubRepoResponse("OWNER", "REPO")
-	http.StubResponse(200, bytes.NewBufferString(`
-	{ "data": { "repository": { "forks": { "nodes": [
-	] } } } }
-	`))
+	http.Register(
+		httpmock.GraphQL(`query UserCurrent\b`),
+		httpmock.StringResponse(`{"data": {"viewer": {"login": "OWNER"} } }`))
 
 	cs, cmdTeardown := test.InitCmdStubber()
 	defer cmdTeardown()
@@ -577,6 +705,10 @@ func TestPRCreate_web(t *testing.T) {
 	cs.Stub("")                                         // git push
 	cs.Stub("")                                         // browser
 
+	ask, cleanupAsk := prompt.InitAskStubber()
+	defer cleanupAsk()
+	ask.StubOne(0)
+
 	output, err := runCommand(http, nil, "feature", true, `--web`)
 	require.NoError(t, err)
 
@@ -587,552 +719,6 @@ func TestPRCreate_web(t *testing.T) {
 	eq(t, strings.Join(cs.Calls[4].Args, " "), "git push --set-upstream origin HEAD:feature")
 	browserCall := cs.Calls[5].Args
 	eq(t, browserCall[len(browserCall)-1], "https://github.com/OWNER/REPO/compare/master...feature?expand=1")
-}
-
-func TestPRCreate_ReportsUncommittedChanges(t *testing.T) {
-	http := initFakeHTTP()
-	defer http.Verify(t)
-
-	http.StubRepoResponse("OWNER", "REPO")
-	http.StubResponse(200, bytes.NewBufferString(`
-	{ "data": { "repository": { "forks": { "nodes": [
-	] } } } }
-	`))
-	http.StubResponse(200, bytes.NewBufferString(`
-		{ "data": { "repository": { "pullRequests": { "nodes" : [
-		] } } } }
-	`))
-	http.StubResponse(200, bytes.NewBufferString(`
-		{ "data": { "createPullRequest": { "pullRequest": {
-			"URL": "https://github.com/OWNER/REPO/pull/12"
-		} } } }
-	`))
-
-	cs, cmdTeardown := test.InitCmdStubber()
-	defer cmdTeardown()
-
-	cs.Stub("")                                         // git config --get-regexp (determineTrackingBranch)
-	cs.Stub("")                                         // git show-ref --verify   (determineTrackingBranch)
-	cs.Stub(" M git/git.go")                            // git status
-	cs.Stub("1234567890,commit 0\n2345678901,commit 1") // git log
-	cs.Stub("")                                         // git push
-
-	output, err := runCommand(http, nil, "feature", true, `-t "my title" -b "my body"`)
-	eq(t, err, nil)
-
-	eq(t, output.String(), "https://github.com/OWNER/REPO/pull/12\n")
-	test.ExpectLines(t, output.Stderr(), `Warning: 1 uncommitted change`, `Creating pull request for.*feature.*into.*master.*in OWNER/REPO`)
-}
-
-func TestPRCreate_cross_repo_same_branch(t *testing.T) {
-	remotes := context.Remotes{
-		{
-			Remote: &git.Remote{Name: "origin"},
-			Repo:   ghrepo.New("OWNER", "REPO"),
-		},
-		{
-			Remote: &git.Remote{Name: "fork"},
-			Repo:   ghrepo.New("MYSELF", "REPO"),
-		},
-	}
-
-	http := initFakeHTTP()
-	defer http.Verify(t)
-
-	http.StubResponse(200, bytes.NewBufferString(`
-		{ "data": { "repo_000": {
-									"id": "REPOID0",
-									"name": "REPO",
-									"owner": {"login": "OWNER"},
-									"defaultBranchRef": {
-										"name": "default"
-									},
-									"viewerPermission": "READ"
-								},
-								"repo_001" : {
-									"parent": {
-										"id": "REPOID0",
-										"name": "REPO",
-										"owner": {"login": "OWNER"},
-										"defaultBranchRef": {
-											"name": "default"
-										},
-										"viewerPermission": "READ"
-									},
-									"id": "REPOID1",
-									"name": "REPO",
-									"owner": {"login": "MYSELF"},
-									"defaultBranchRef": {
-										"name": "default"
-									},
-									"viewerPermission": "WRITE"
-		} } }
-	`))
-	http.StubResponse(200, bytes.NewBufferString(`
-		{ "data": { "repository": { "pullRequests": { "nodes" : [
-		] } } } }
-	`))
-	http.StubResponse(200, bytes.NewBufferString(`
-		{ "data": { "createPullRequest": { "pullRequest": {
-			"URL": "https://github.com/OWNER/REPO/pull/12"
-		} } } }
-	`))
-
-	cs, cmdTeardown := test.InitCmdStubber()
-	defer cmdTeardown()
-
-	cs.Stub("")                                         // git config --get-regexp (determineTrackingBranch)
-	cs.Stub("")                                         // git show-ref --verify   (determineTrackingBranch)
-	cs.Stub("")                                         // git status
-	cs.Stub("1234567890,commit 0\n2345678901,commit 1") // git log
-	cs.Stub("")                                         // git push
-
-	output, err := runCommand(http, remotes, "default", true, `-t "cross repo" -b "same branch"`)
-	require.NoError(t, err)
-
-	bodyBytes, _ := ioutil.ReadAll(http.Requests[2].Body)
-	reqBody := struct {
-		Variables struct {
-			Input struct {
-				RepositoryID string
-				Title        string
-				Body         string
-				BaseRefName  string
-				HeadRefName  string
-			}
-		}
-	}{}
-	_ = json.Unmarshal(bodyBytes, &reqBody)
-
-	eq(t, reqBody.Variables.Input.RepositoryID, "REPOID0")
-	eq(t, reqBody.Variables.Input.Title, "cross repo")
-	eq(t, reqBody.Variables.Input.Body, "same branch")
-	eq(t, reqBody.Variables.Input.BaseRefName, "default")
-	eq(t, reqBody.Variables.Input.HeadRefName, "MYSELF:default")
-
-	eq(t, output.String(), "https://github.com/OWNER/REPO/pull/12\n")
-
-	// goal: only care that gql is formatted properly
-}
-
-func TestPRCreate_survey_defaults_multicommit(t *testing.T) {
-	http := initFakeHTTP()
-	defer http.Verify(t)
-
-	http.StubRepoResponse("OWNER", "REPO")
-	http.StubResponse(200, bytes.NewBufferString(`
-	{ "data": { "repository": { "forks": { "nodes": [
-	] } } } }
-	`))
-	http.StubResponse(200, bytes.NewBufferString(`
-		{ "data": { "repository": { "pullRequests": { "nodes" : [
-		] } } } }
-	`))
-	http.StubResponse(200, bytes.NewBufferString(`
-		{ "data": { "createPullRequest": { "pullRequest": {
-			"URL": "https://github.com/OWNER/REPO/pull/12"
-		} } } }
-	`))
-
-	cs, cmdTeardown := test.InitCmdStubber()
-	defer cmdTeardown()
-
-	cs.Stub("")                                         // git config --get-regexp (determineTrackingBranch)
-	cs.Stub("")                                         // git show-ref --verify   (determineTrackingBranch)
-	cs.Stub("")                                         // git status
-	cs.Stub("1234567890,commit 0\n2345678901,commit 1") // git log
-	cs.Stub("")                                         // git rev-parse
-	cs.Stub("")                                         // git push
-
-	as, surveyTeardown := prompt.InitAskStubber()
-	defer surveyTeardown()
-
-	as.Stub([]*prompt.QuestionStub{
-		{
-			Name:    "title",
-			Default: true,
-		},
-		{
-			Name:    "body",
-			Default: true,
-		},
-	})
-	as.Stub([]*prompt.QuestionStub{
-		{
-			Name:  "confirmation",
-			Value: 0,
-		},
-	})
-
-	output, err := runCommand(http, nil, "cool_bug-fixes", true, ``)
-	require.NoError(t, err)
-
-	bodyBytes, _ := ioutil.ReadAll(http.Requests[3].Body)
-	reqBody := struct {
-		Variables struct {
-			Input struct {
-				RepositoryID string
-				Title        string
-				Body         string
-				BaseRefName  string
-				HeadRefName  string
-			}
-		}
-	}{}
-	_ = json.Unmarshal(bodyBytes, &reqBody)
-
-	expectedBody := "- commit 1\n- commit 0\n"
-
-	eq(t, reqBody.Variables.Input.RepositoryID, "REPOID")
-	eq(t, reqBody.Variables.Input.Title, "cool bug fixes")
-	eq(t, reqBody.Variables.Input.Body, expectedBody)
-	eq(t, reqBody.Variables.Input.BaseRefName, "master")
-	eq(t, reqBody.Variables.Input.HeadRefName, "cool_bug-fixes")
-
-	eq(t, output.String(), "https://github.com/OWNER/REPO/pull/12\n")
-}
-
-func TestPRCreate_survey_defaults_monocommit(t *testing.T) {
-	http := initFakeHTTP()
-	defer http.Verify(t)
-
-	http.Register(httpmock.GraphQL(`query RepositoryNetwork\b`), httpmock.StringResponse(httpmock.RepoNetworkStubResponse("OWNER", "REPO", "master", "WRITE")))
-	http.Register(httpmock.GraphQL(`query RepositoryFindFork\b`), httpmock.StringResponse(`
-		{ "data": { "repository": { "forks": { "nodes": [
-		] } } } }
-	`))
-	http.Register(httpmock.GraphQL(`query PullRequestForBranch\b`), httpmock.StringResponse(`
-		{ "data": { "repository": { "pullRequests": { "nodes" : [
-		] } } } }
-	`))
-	http.Register(httpmock.GraphQL(`mutation PullRequestCreate\b`), httpmock.GraphQLMutation(`
-		{ "data": { "createPullRequest": { "pullRequest": {
-			"URL": "https://github.com/OWNER/REPO/pull/12"
-		} } } }
-	`, func(inputs map[string]interface{}) {
-		eq(t, inputs["repositoryId"], "REPOID")
-		eq(t, inputs["title"], "the sky above the port")
-		eq(t, inputs["body"], "was the color of a television, turned to a dead channel")
-		eq(t, inputs["baseRefName"], "master")
-		eq(t, inputs["headRefName"], "feature")
-	}))
-
-	cs, cmdTeardown := test.InitCmdStubber()
-	defer cmdTeardown()
-
-	cs.Stub("")                                                        // git config --get-regexp (determineTrackingBranch)
-	cs.Stub("")                                                        // git show-ref --verify   (determineTrackingBranch)
-	cs.Stub("")                                                        // git status
-	cs.Stub("1234567890,the sky above the port")                       // git log
-	cs.Stub("was the color of a television, turned to a dead channel") // git show
-	cs.Stub("")                                                        // git rev-parse
-	cs.Stub("")                                                        // git push
-
-	as, surveyTeardown := prompt.InitAskStubber()
-	defer surveyTeardown()
-
-	as.Stub([]*prompt.QuestionStub{
-		{
-			Name:    "title",
-			Default: true,
-		},
-		{
-			Name:    "body",
-			Default: true,
-		},
-	})
-	as.Stub([]*prompt.QuestionStub{
-		{
-			Name:  "confirmation",
-			Value: 0,
-		},
-	})
-
-	output, err := runCommand(http, nil, "feature", true, ``)
-	eq(t, err, nil)
-	eq(t, output.String(), "https://github.com/OWNER/REPO/pull/12\n")
-}
-
-func TestPRCreate_survey_defaults_monocommit_template(t *testing.T) {
-	http := initFakeHTTP()
-	defer http.Verify(t)
-
-	http.Register(httpmock.GraphQL(`query RepositoryNetwork\b`), httpmock.StringResponse(httpmock.RepoNetworkStubResponse("OWNER", "REPO", "master", "WRITE")))
-	http.Register(httpmock.GraphQL(`query RepositoryFindFork\b`), httpmock.StringResponse(`
-		{ "data": { "repository": { "forks": { "nodes": [
-		] } } } }
-	`))
-	http.Register(httpmock.GraphQL(`query PullRequestForBranch\b`), httpmock.StringResponse(`
-		{ "data": { "repository": { "pullRequests": { "nodes" : [
-		] } } } }
-	`))
-	http.Register(httpmock.GraphQL(`mutation PullRequestCreate\b`), httpmock.GraphQLMutation(`
-		{ "data": { "createPullRequest": { "pullRequest": {
-			"URL": "https://github.com/OWNER/REPO/pull/12"
-		} } } }
-	`, func(inputs map[string]interface{}) {
-		eq(t, inputs["repositoryId"], "REPOID")
-		eq(t, inputs["title"], "the sky above the port")
-		eq(t, inputs["body"], "was the color of a television\n\n... turned to a dead channel")
-		eq(t, inputs["baseRefName"], "master")
-		eq(t, inputs["headRefName"], "feature")
-	}))
-
-	cs, cmdTeardown := test.InitCmdStubber()
-	defer cmdTeardown()
-
-	tmpdir, err := ioutil.TempDir("", "gh-cli")
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer os.RemoveAll(tmpdir)
-
-	templateFp := path.Join(tmpdir, ".github/PULL_REQUEST_TEMPLATE.md")
-	_ = os.MkdirAll(path.Dir(templateFp), 0700)
-	_ = ioutil.WriteFile(templateFp, []byte("... turned to a dead channel"), 0700)
-
-	cs.Stub("")                                  // git config --get-regexp (determineTrackingBranch)
-	cs.Stub("")                                  // git show-ref --verify   (determineTrackingBranch)
-	cs.Stub("")                                  // git status
-	cs.Stub("1234567890,the sky above the port") // git log
-	cs.Stub("was the color of a television")     // git show
-	cs.Stub(tmpdir)                              // git rev-parse
-	cs.Stub("")                                  // git push
-
-	as, surveyTeardown := prompt.InitAskStubber()
-	defer surveyTeardown()
-
-	as.Stub([]*prompt.QuestionStub{
-		{
-			Name:    "title",
-			Default: true,
-		},
-		{
-			Name:    "body",
-			Default: true,
-		},
-	})
-	as.Stub([]*prompt.QuestionStub{
-		{
-			Name:  "confirmation",
-			Value: 0,
-		},
-	})
-
-	output, err := runCommand(http, nil, "feature", true, ``)
-	eq(t, err, nil)
-	eq(t, output.String(), "https://github.com/OWNER/REPO/pull/12\n")
-}
-
-func TestPRCreate_survey_autofill_nontty(t *testing.T) {
-	http := initFakeHTTP()
-	defer http.Verify(t)
-
-	http.StubRepoResponse("OWNER", "REPO")
-	http.StubResponse(200, bytes.NewBufferString(`
-	{ "data": { "repository": { "forks": { "nodes": [
-	] } } } }
-	`))
-	http.StubResponse(200, bytes.NewBufferString(`
-		{ "data": { "repository": { "pullRequests": { "nodes" : [
-		] } } } }
-	`))
-	http.StubResponse(200, bytes.NewBufferString(`
-		{ "data": { "createPullRequest": { "pullRequest": {
-			"URL": "https://github.com/OWNER/REPO/pull/12"
-		} } } }
-	`))
-
-	cs, cmdTeardown := test.InitCmdStubber()
-	defer cmdTeardown()
-
-	cs.Stub("")                                                        // git config --get-regexp (determineTrackingBranch)
-	cs.Stub("")                                                        // git show-ref --verify   (determineTrackingBranch)
-	cs.Stub("")                                                        // git status
-	cs.Stub("1234567890,the sky above the port")                       // git log
-	cs.Stub("was the color of a television, turned to a dead channel") // git show
-	cs.Stub("")                                                        // git rev-parse
-	cs.Stub("")                                                        // git push
-	cs.Stub("")                                                        // browser open
-
-	output, err := runCommand(http, nil, "feature", false, `-f`)
-	require.NoError(t, err)
-
-	bodyBytes, _ := ioutil.ReadAll(http.Requests[3].Body)
-	reqBody := struct {
-		Variables struct {
-			Input struct {
-				RepositoryID string
-				Title        string
-				Body         string
-				BaseRefName  string
-				HeadRefName  string
-			}
-		}
-	}{}
-	_ = json.Unmarshal(bodyBytes, &reqBody)
-
-	expectedBody := "was the color of a television, turned to a dead channel"
-
-	assert.Equal(t, "REPOID", reqBody.Variables.Input.RepositoryID)
-	assert.Equal(t, "the sky above the port", reqBody.Variables.Input.Title)
-	assert.Equal(t, expectedBody, reqBody.Variables.Input.Body)
-	assert.Equal(t, "master", reqBody.Variables.Input.BaseRefName)
-	assert.Equal(t, "feature", reqBody.Variables.Input.HeadRefName)
-
-	assert.Equal(t, "https://github.com/OWNER/REPO/pull/12\n", output.String())
-
-	assert.Equal(t, "", output.Stderr())
-}
-
-func TestPRCreate_survey_autofill(t *testing.T) {
-	http := initFakeHTTP()
-	defer http.Verify(t)
-
-	http.StubRepoResponse("OWNER", "REPO")
-	http.StubResponse(200, bytes.NewBufferString(`
-	{ "data": { "repository": { "forks": { "nodes": [
-	] } } } }
-	`))
-	http.StubResponse(200, bytes.NewBufferString(`
-		{ "data": { "repository": { "pullRequests": { "nodes" : [
-		] } } } }
-	`))
-	http.StubResponse(200, bytes.NewBufferString(`
-		{ "data": { "createPullRequest": { "pullRequest": {
-			"URL": "https://github.com/OWNER/REPO/pull/12"
-		} } } }
-	`))
-
-	cs, cmdTeardown := test.InitCmdStubber()
-	defer cmdTeardown()
-
-	cs.Stub("")                                                        // git config --get-regexp (determineTrackingBranch)
-	cs.Stub("")                                                        // git show-ref --verify   (determineTrackingBranch)
-	cs.Stub("")                                                        // git status
-	cs.Stub("1234567890,the sky above the port")                       // git log
-	cs.Stub("was the color of a television, turned to a dead channel") // git show
-	cs.Stub("")                                                        // git rev-parse
-	cs.Stub("")                                                        // git push
-	cs.Stub("")                                                        // browser open
-
-	output, err := runCommand(http, nil, "feature", true, `-f`)
-	require.NoError(t, err)
-
-	bodyBytes, _ := ioutil.ReadAll(http.Requests[3].Body)
-	reqBody := struct {
-		Variables struct {
-			Input struct {
-				RepositoryID string
-				Title        string
-				Body         string
-				BaseRefName  string
-				HeadRefName  string
-			}
-		}
-	}{}
-	_ = json.Unmarshal(bodyBytes, &reqBody)
-
-	expectedBody := "was the color of a television, turned to a dead channel"
-
-	eq(t, reqBody.Variables.Input.RepositoryID, "REPOID")
-	eq(t, reqBody.Variables.Input.Title, "the sky above the port")
-	eq(t, reqBody.Variables.Input.Body, expectedBody)
-	eq(t, reqBody.Variables.Input.BaseRefName, "master")
-	eq(t, reqBody.Variables.Input.HeadRefName, "feature")
-
-	eq(t, output.String(), "https://github.com/OWNER/REPO/pull/12\n")
-}
-
-func TestPRCreate_defaults_error_autofill(t *testing.T) {
-	http := initFakeHTTP()
-	defer http.Verify(t)
-
-	http.StubRepoResponse("OWNER", "REPO")
-
-	cs, cmdTeardown := test.InitCmdStubber()
-	defer cmdTeardown()
-
-	cs.Stub("") // git config --get-regexp (determineTrackingBranch)
-	cs.Stub("") // git show-ref --verify   (determineTrackingBranch)
-	cs.Stub("") // git status
-	cs.Stub("") // git log
-
-	_, err := runCommand(http, nil, "feature", true, "-f")
-
-	eq(t, err.Error(), "could not compute title or body defaults: could not find any commits between origin/master and feature")
-}
-
-func TestPRCreate_defaults_error_web(t *testing.T) {
-	http := initFakeHTTP()
-	defer http.Verify(t)
-
-	http.StubRepoResponse("OWNER", "REPO")
-
-	cs, cmdTeardown := test.InitCmdStubber()
-	defer cmdTeardown()
-
-	cs.Stub("") // git config --get-regexp (determineTrackingBranch)
-	cs.Stub("") // git show-ref --verify   (determineTrackingBranch)
-	cs.Stub("") // git status
-	cs.Stub("") // git log
-
-	_, err := runCommand(http, nil, "feature", true, "-w")
-
-	eq(t, err.Error(), "could not compute title or body defaults: could not find any commits between origin/master and feature")
-}
-
-func TestPRCreate_defaults_error_interactive(t *testing.T) {
-	http := initFakeHTTP()
-	defer http.Verify(t)
-
-	http.StubRepoResponse("OWNER", "REPO")
-	http.StubResponse(200, bytes.NewBufferString(`
-	{ "data": { "repository": { "forks": { "nodes": [
-	] } } } }
-	`))
-	http.StubResponse(200, bytes.NewBufferString(`
-		{ "data": { "createPullRequest": { "pullRequest": {
-			"URL": "https://github.com/OWNER/REPO/pull/12"
-		} } } }
-	`))
-
-	cs, cmdTeardown := test.InitCmdStubber()
-	defer cmdTeardown()
-
-	cs.Stub("") // git config --get-regexp (determineTrackingBranch)
-	cs.Stub("") // git show-ref --verify   (determineTrackingBranch)
-	cs.Stub("") // git status
-	cs.Stub("") // git log
-	cs.Stub("") // git rev-parse
-	cs.Stub("") // git push
-	cs.Stub("") // browser open
-
-	as, surveyTeardown := prompt.InitAskStubber()
-	defer surveyTeardown()
-
-	as.Stub([]*prompt.QuestionStub{
-		{
-			Name:    "title",
-			Default: true,
-		},
-		{
-			Name:  "body",
-			Value: "social distancing",
-		},
-	})
-	as.Stub([]*prompt.QuestionStub{
-		{
-			Name:  "confirmation",
-			Value: 1,
-		},
-	})
-
-	output, err := runCommand(http, nil, "feature", true, ``)
-	require.NoError(t, err)
-
-	stderr := string(output.Stderr())
-	eq(t, strings.Contains(stderr, "warning: could not compute title or body defaults: could not find any commits"), true)
 }
 
 func Test_determineTrackingBranch_empty(t *testing.T) {
@@ -1228,4 +814,60 @@ deadb00f refs/remotes/origin/feature`) // git show-ref --verify (ShowRefs)
 	}
 
 	eq(t, cs.Calls[1].Args, []string{"git", "show-ref", "--verify", "--", "HEAD", "refs/remotes/origin/great-feat", "refs/remotes/origin/feature"})
+}
+
+func Test_generateCompareURL(t *testing.T) {
+	tests := []struct {
+		name    string
+		ctx     CreateContext
+		state   prShared.IssueMetadataState
+		want    string
+		wantErr bool
+	}{
+		{
+			name: "basic",
+			ctx: CreateContext{
+				BaseRepo:   ghrepo.New("OWNER", "REPO"),
+				BaseBranch: "main",
+				HeadBranch: "feature",
+			},
+			want:    "https://github.com/OWNER/REPO/compare/main...feature?expand=1",
+			wantErr: false,
+		},
+		{
+			name: "with labels",
+			ctx: CreateContext{
+				BaseRepo:   ghrepo.New("OWNER", "REPO"),
+				BaseBranch: "a",
+				HeadBranch: "b",
+			},
+			state: prShared.IssueMetadataState{
+				Labels: []string{"one", "two three"},
+			},
+			want:    "https://github.com/OWNER/REPO/compare/a...b?expand=1&labels=one%2Ctwo+three",
+			wantErr: false,
+		},
+		{
+			name: "complex branch names",
+			ctx: CreateContext{
+				BaseRepo:   ghrepo.New("OWNER", "REPO"),
+				BaseBranch: "main/trunk",
+				HeadBranch: "owner:feature",
+			},
+			want:    "https://github.com/OWNER/REPO/compare/main%2Ftrunk...owner%3Afeature?expand=1",
+			wantErr: false,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got, err := generateCompareURL(tt.ctx, tt.state)
+			if (err != nil) != tt.wantErr {
+				t.Errorf("generateCompareURL() error = %v, wantErr %v", err, tt.wantErr)
+				return
+			}
+			if got != tt.want {
+				t.Errorf("generateCompareURL() = %v, want %v", got, tt.want)
+			}
+		})
+	}
 }
