@@ -1,9 +1,12 @@
 package view
 
 import (
+	"errors"
 	"fmt"
 	"net/http"
+	"net/url"
 	"strings"
+	"syscall"
 	"text/template"
 
 	"github.com/MakeNowJust/heredoc"
@@ -12,17 +15,24 @@ import (
 	"github.com/cli/cli/internal/ghrepo"
 	"github.com/cli/cli/pkg/cmdutil"
 	"github.com/cli/cli/pkg/iostreams"
+	"github.com/cli/cli/pkg/markdown"
 	"github.com/cli/cli/utils"
 	"github.com/spf13/cobra"
 )
+
+type browser interface {
+	Browse(string) error
+}
 
 type ViewOptions struct {
 	HttpClient func() (*http.Client, error)
 	IO         *iostreams.IOStreams
 	BaseRepo   func() (ghrepo.Interface, error)
+	Browser    browser
 
 	RepoArg string
 	Web     bool
+	Branch  string
 }
 
 func NewCmdView(f *cmdutil.Factory, runF func(*ViewOptions) error) *cobra.Command {
@@ -30,6 +40,7 @@ func NewCmdView(f *cmdutil.Factory, runF func(*ViewOptions) error) *cobra.Comman
 		IO:         f.IOStreams,
 		HttpClient: f.HttpClient,
 		BaseRepo:   f.BaseRepo,
+		Browser:    f.Browser,
 	}
 
 	cmd := &cobra.Command{
@@ -39,7 +50,9 @@ func NewCmdView(f *cmdutil.Factory, runF func(*ViewOptions) error) *cobra.Comman
 
 With no argument, the repository for the current directory is displayed.
 
-With '--web', open the repository in a web browser instead.`,
+With '--web', open the repository in a web browser instead.
+
+With '--branch', view a specific branch of the repository.`,
 		Args: cobra.MaximumNArgs(1),
 		RunE: func(c *cobra.Command, args []string) error {
 			if len(args) > 0 {
@@ -53,6 +66,7 @@ With '--web', open the repository in a web browser instead.`,
 	}
 
 	cmd.Flags().BoolVarP(&opts.Web, "web", "w", false, "Open a repository in the browser")
+	cmd.Flags().StringVarP(&opts.Branch, "branch", "b", "", "View a specific branch of the repository")
 
 	return cmd
 }
@@ -92,20 +106,28 @@ func viewRun(opts *ViewOptions) error {
 		return err
 	}
 
-	openURL := ghrepo.GenerateRepoURL(toView, "")
+	openURL := generateBranchURL(toView, opts.Branch)
 	if opts.Web {
 		if opts.IO.IsStdoutTTY() {
 			fmt.Fprintf(opts.IO.ErrOut, "Opening %s in your browser.\n", utils.DisplayURL(openURL))
 		}
-		return utils.OpenInBrowser(openURL)
+		return opts.Browser.Browse(openURL)
 	}
 
 	fullName := ghrepo.FullName(toView)
 
-	readme, err := RepositoryReadme(httpClient, toView)
+	readme, err := RepositoryReadme(httpClient, toView, opts.Branch)
 	if err != nil && err != NotFoundError {
 		return err
 	}
+
+	opts.IO.DetectTerminalTheme()
+
+	err = opts.IO.StartPager()
+	if err != nil {
+		return err
+	}
+	defer opts.IO.StopPager()
 
 	stdout := opts.IO.Out
 
@@ -124,9 +146,9 @@ func viewRun(opts *ViewOptions) error {
 	repoTmpl := heredoc.Doc(`
 		{{.FullName}}
 		{{.Description}}
-		
+
 		{{.Readme}}
-		
+
 		{{.View}}
 	`)
 
@@ -135,12 +157,15 @@ func viewRun(opts *ViewOptions) error {
 		return err
 	}
 
+	cs := opts.IO.ColorScheme()
+
 	var readmeContent string
 	if readme == nil {
-		readmeContent = utils.Gray("This repository does not have a README")
+		readmeContent = cs.Gray("This repository does not have a README")
 	} else if isMarkdownFile(readme.Filename) {
 		var err error
-		readmeContent, err = utils.RenderMarkdown(readme.Content)
+		style := markdown.GetStyle(opts.IO.TerminalTheme())
+		readmeContent, err = markdown.RenderWithBaseURL(readme.Content, style, readme.BaseURL)
 		if err != nil {
 			return fmt.Errorf("error rendering markdown: %w", err)
 		}
@@ -150,7 +175,7 @@ func viewRun(opts *ViewOptions) error {
 
 	description := repo.Description
 	if description == "" {
-		description = utils.Gray("No description provided")
+		description = cs.Gray("No description provided")
 	}
 
 	repoData := struct {
@@ -159,14 +184,14 @@ func viewRun(opts *ViewOptions) error {
 		Readme      string
 		View        string
 	}{
-		FullName:    utils.Bold(fullName),
+		FullName:    cs.Bold(fullName),
 		Description: description,
 		Readme:      readmeContent,
-		View:        utils.Gray(fmt.Sprintf("View this repository on GitHub: %s", openURL)),
+		View:        cs.Gray(fmt.Sprintf("View this repository on GitHub: %s", openURL)),
 	}
 
 	err = tmpl.Execute(stdout, repoData)
-	if err != nil {
+	if err != nil && !errors.Is(err, syscall.EPIPE) {
 		return err
 	}
 
@@ -180,4 +205,12 @@ func isMarkdownFile(filename string) bool {
 		strings.HasSuffix(filename, ".markdown") ||
 		strings.HasSuffix(filename, ".mdown") ||
 		strings.HasSuffix(filename, ".mkdown")
+}
+
+func generateBranchURL(r ghrepo.Interface, branch string) string {
+	if branch == "" {
+		return ghrepo.GenerateRepoURL(r, "")
+	}
+
+	return ghrepo.GenerateRepoURL(r, "tree/%s", url.QueryEscape(branch))
 }

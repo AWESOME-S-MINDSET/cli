@@ -4,7 +4,6 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
-	"errors"
 	"fmt"
 	"net/http"
 	"sort"
@@ -27,10 +26,15 @@ type Repository struct {
 
 	IsPrivate        bool
 	HasIssuesEnabled bool
+	HasWikiEnabled   bool
 	ViewerPermission string
 	DefaultBranchRef BranchRef
 
 	Parent *Repository
+
+	MergeCommitAllowed bool
+	RebaseMergeAllowed bool
+	SquashMergeAllowed bool
 
 	// pseudo-field that keeps track of host name of this repo
 	hostname string
@@ -88,15 +92,28 @@ func (r Repository) ViewerCanTriage() bool {
 
 func GitHubRepo(client *Client, repo ghrepo.Interface) (*Repository, error) {
 	query := `
+	fragment repo on Repository {
+		id
+		name
+		owner { login }
+		hasIssuesEnabled
+		description
+		hasWikiEnabled
+		viewerPermission
+		defaultBranchRef {
+			name
+		}
+	}
+
 	query RepositoryInfo($owner: String!, $name: String!) {
 		repository(owner: $owner, name: $name) {
-			id
-			hasIssuesEnabled
-			description
-			viewerPermission
-			defaultBranchRef {
-				name
+			...repo
+			parent {
+				...repo
 			}
+			mergeCommitAllowed
+			rebaseMergeAllowed
+			squashMergeAllowed
 		}
 	}`
 	variables := map[string]interface{}{
@@ -317,8 +334,8 @@ func ForkRepo(client *Client, repo ghrepo.Interface) (*Repository, error) {
 	}, nil
 }
 
-// RepoFindFork finds a fork of repo affiliated with the viewer
-func RepoFindFork(client *Client, repo ghrepo.Interface) (*Repository, error) {
+// RepoFindForks finds forks of the repo that are affiliated with the viewer
+func RepoFindForks(client *Client, repo ghrepo.Interface, limit int) ([]*Repository, error) {
 	result := struct {
 		Repository struct {
 			Forks struct {
@@ -330,12 +347,13 @@ func RepoFindFork(client *Client, repo ghrepo.Interface) (*Repository, error) {
 	variables := map[string]interface{}{
 		"owner": repo.RepoOwner(),
 		"repo":  repo.RepoName(),
+		"limit": limit,
 	}
 
 	if err := client.GraphQL(repo.RepoHost(), `
-	query RepositoryFindFork($owner: String!, $repo: String!) {
+	query RepositoryFindFork($owner: String!, $repo: String!, $limit: Int!) {
 		repository(owner: $owner, name: $repo) {
-			forks(first: 1, affiliations: [OWNER, COLLABORATOR]) {
+			forks(first: $limit, affiliations: [OWNER, COLLABORATOR]) {
 				nodes {
 					id
 					name
@@ -350,14 +368,18 @@ func RepoFindFork(client *Client, repo ghrepo.Interface) (*Repository, error) {
 		return nil, err
 	}
 
-	forks := result.Repository.Forks.Nodes
-	// we check ViewerCanPush, even though we expect it to always be true per
-	// `affiliations` condition, to guard against versions of GitHub with a
-	// faulty `affiliations` implementation
-	if len(forks) > 0 && forks[0].ViewerCanPush() {
-		return InitRepoHostname(&forks[0], repo.RepoHost()), nil
+	var results []*Repository
+	for _, r := range result.Repository.Forks.Nodes {
+		// we check ViewerCanPush, even though we expect it to always be true per
+		// `affiliations` condition, to guard against versions of GitHub with a
+		// faulty `affiliations` implementation
+		if !r.ViewerCanPush() {
+			continue
+		}
+		results = append(results, InitRepoHostname(&r, repo.RepoHost()))
 	}
-	return nil, &NotFoundError{errors.New("no fork found")}
+
+	return results, nil
 }
 
 type RepoMetadataResult struct {
@@ -441,13 +463,62 @@ func (m *RepoMetadataResult) ProjectsToIDs(names []string) ([]string, error) {
 	return ids, nil
 }
 
+func ProjectsToPaths(projects []RepoProject, names []string) ([]string, error) {
+	var paths []string
+	for _, projectName := range names {
+		found := false
+		for _, p := range projects {
+			if strings.EqualFold(projectName, p.Name) {
+				// format of ResourcePath: /OWNER/REPO/projects/PROJECT_NUMBER or /orgs/ORG/projects/PROJECT_NUMBER
+				// required format of path: OWNER/REPO/PROJECT_NUMBER or ORG/PROJECT_NUMBER
+				var path string
+				pathParts := strings.Split(p.ResourcePath, "/")
+				if pathParts[1] == "orgs" {
+					path = fmt.Sprintf("%s/%s", pathParts[2], pathParts[4])
+				} else {
+					path = fmt.Sprintf("%s/%s/%s", pathParts[1], pathParts[2], pathParts[4])
+				}
+				paths = append(paths, path)
+				found = true
+				break
+			}
+		}
+		if !found {
+			return nil, fmt.Errorf("'%s' not found", projectName)
+		}
+	}
+	return paths, nil
+}
+
 func (m *RepoMetadataResult) MilestoneToID(title string) (string, error) {
 	for _, m := range m.Milestones {
 		if strings.EqualFold(title, m.Title) {
 			return m.ID, nil
 		}
 	}
-	return "", errors.New("not found")
+	return "", fmt.Errorf("'%s' not found", title)
+}
+
+func (m *RepoMetadataResult) Merge(m2 *RepoMetadataResult) {
+	if len(m2.AssignableUsers) > 0 || len(m.AssignableUsers) == 0 {
+		m.AssignableUsers = m2.AssignableUsers
+	}
+
+	if len(m2.Teams) > 0 || len(m.Teams) == 0 {
+		m.Teams = m2.Teams
+	}
+
+	if len(m2.Labels) > 0 || len(m.Labels) == 0 {
+		m.Labels = m2.Labels
+	}
+
+	if len(m2.Projects) > 0 || len(m.Projects) == 0 {
+		m.Projects = m2.Projects
+	}
+
+	if len(m2.Milestones) > 0 || len(m.Milestones) == 0 {
+		m.Milestones = m2.Milestones
+	}
 }
 
 type RepoMetadataInput struct {
@@ -502,27 +573,19 @@ func RepoMetadata(client *Client, repo ghrepo.Interface, input RepoMetadataInput
 	if input.Projects {
 		count++
 		go func() {
-			projects, err := RepoProjects(client, repo)
+			projects, err := RepoAndOrgProjects(client, repo)
 			if err != nil {
-				errc <- fmt.Errorf("error fetching projects: %w", err)
+				errc <- err
 				return
 			}
 			result.Projects = projects
-
-			orgProjects, err := OrganizationProjects(client, repo)
-			// TODO: better detection of non-org repos
-			if err != nil && !strings.HasPrefix(err.Error(), "Could not resolve to an Organization") {
-				errc <- fmt.Errorf("error fetching organization projects: %w", err)
-				return
-			}
-			result.Projects = append(result.Projects, orgProjects...)
 			errc <- nil
 		}()
 	}
 	if input.Milestones {
 		count++
 		go func() {
-			milestones, err := RepoMilestones(client, repo)
+			milestones, err := RepoMilestones(client, repo, "open")
 			if err != nil {
 				err = fmt.Errorf("error fetching milestones: %w", err)
 			}
@@ -644,13 +707,14 @@ func RepoResolveMetadataIDs(client *Client, repo ghrepo.Interface, input RepoRes
 }
 
 type RepoProject struct {
-	ID   string
-	Name string
+	ID           string
+	Name         string
+	ResourcePath string
 }
 
 // RepoProjects fetches all open projects for a repository
 func RepoProjects(client *Client, repo ghrepo.Interface) ([]RepoProject, error) {
-	var query struct {
+	type responseData struct {
 		Repository struct {
 			Projects struct {
 				Nodes    []RepoProject
@@ -672,6 +736,7 @@ func RepoProjects(client *Client, repo ghrepo.Interface) ([]RepoProject, error) 
 
 	var projects []RepoProject
 	for {
+		var query responseData
 		err := gql.QueryNamed(context.Background(), "RepositoryProjectList", &query, variables)
 		if err != nil {
 			return nil, err
@@ -687,6 +752,23 @@ func RepoProjects(client *Client, repo ghrepo.Interface) ([]RepoProject, error) 
 	return projects, nil
 }
 
+// RepoAndOrgProjects fetches all open projects for a repository and its org
+func RepoAndOrgProjects(client *Client, repo ghrepo.Interface) ([]RepoProject, error) {
+	projects, err := RepoProjects(client, repo)
+	if err != nil {
+		return projects, fmt.Errorf("error fetching projects: %w", err)
+	}
+
+	orgProjects, err := OrganizationProjects(client, repo)
+	// TODO: better detection of non-org repos
+	if err != nil && !strings.HasPrefix(err.Error(), "Could not resolve to an Organization") {
+		return projects, fmt.Errorf("error fetching organization projects: %w", err)
+	}
+	projects = append(projects, orgProjects...)
+
+	return projects, nil
+}
+
 type RepoAssignee struct {
 	ID    string
 	Login string
@@ -694,7 +776,7 @@ type RepoAssignee struct {
 
 // RepoAssignableUsers fetches all the assignable users for a repository
 func RepoAssignableUsers(client *Client, repo ghrepo.Interface) ([]RepoAssignee, error) {
-	var query struct {
+	type responseData struct {
 		Repository struct {
 			AssignableUsers struct {
 				Nodes    []RepoAssignee
@@ -716,6 +798,7 @@ func RepoAssignableUsers(client *Client, repo ghrepo.Interface) ([]RepoAssignee,
 
 	var users []RepoAssignee
 	for {
+		var query responseData
 		err := gql.QueryNamed(context.Background(), "RepositoryAssignableUsers", &query, variables)
 		if err != nil {
 			return nil, err
@@ -738,7 +821,7 @@ type RepoLabel struct {
 
 // RepoLabels fetches all the labels in a repository
 func RepoLabels(client *Client, repo ghrepo.Interface) ([]RepoLabel, error) {
-	var query struct {
+	type responseData struct {
 		Repository struct {
 			Labels struct {
 				Nodes    []RepoLabel
@@ -760,6 +843,7 @@ func RepoLabels(client *Client, repo ghrepo.Interface) ([]RepoLabel, error) {
 
 	var labels []RepoLabel
 	for {
+		var query responseData
 		err := gql.QueryNamed(context.Background(), "RepositoryLabelList", &query, variables)
 		if err != nil {
 			return nil, err
@@ -780,9 +864,9 @@ type RepoMilestone struct {
 	Title string
 }
 
-// RepoMilestones fetches all open milestones in a repository
-func RepoMilestones(client *Client, repo ghrepo.Interface) ([]RepoMilestone, error) {
-	var query struct {
+// RepoMilestones fetches milestones in a repository
+func RepoMilestones(client *Client, repo ghrepo.Interface, state string) ([]RepoMilestone, error) {
+	type responseData struct {
 		Repository struct {
 			Milestones struct {
 				Nodes    []RepoMilestone
@@ -790,13 +874,26 @@ func RepoMilestones(client *Client, repo ghrepo.Interface) ([]RepoMilestone, err
 					HasNextPage bool
 					EndCursor   string
 				}
-			} `graphql:"milestones(states: [OPEN], first: 100, after: $endCursor)"`
+			} `graphql:"milestones(states: $states, first: 100, after: $endCursor)"`
 		} `graphql:"repository(owner: $owner, name: $name)"`
+	}
+
+	var states []githubv4.MilestoneState
+	switch state {
+	case "open":
+		states = []githubv4.MilestoneState{"OPEN"}
+	case "closed":
+		states = []githubv4.MilestoneState{"CLOSED"}
+	case "all":
+		states = []githubv4.MilestoneState{"OPEN", "CLOSED"}
+	default:
+		return nil, fmt.Errorf("invalid state: %s", state)
 	}
 
 	variables := map[string]interface{}{
 		"owner":     githubv4.String(repo.RepoOwner()),
 		"name":      githubv4.String(repo.RepoName()),
+		"states":    states,
 		"endCursor": (*githubv4.String)(nil),
 	}
 
@@ -804,6 +901,7 @@ func RepoMilestones(client *Client, repo ghrepo.Interface) ([]RepoMilestone, err
 
 	var milestones []RepoMilestone
 	for {
+		var query responseData
 		err := gql.QueryNamed(context.Background(), "RepositoryMilestoneList", &query, variables)
 		if err != nil {
 			return nil, err
@@ -819,8 +917,8 @@ func RepoMilestones(client *Client, repo ghrepo.Interface) ([]RepoMilestone, err
 	return milestones, nil
 }
 
-func MilestoneByTitle(client *Client, repo ghrepo.Interface, title string) (*RepoMilestone, error) {
-	milestones, err := RepoMilestones(client, repo)
+func MilestoneByTitle(client *Client, repo ghrepo.Interface, state, title string) (*RepoMilestone, error) {
+	milestones, err := RepoMilestones(client, repo, state)
 	if err != nil {
 		return nil, err
 	}
@@ -833,7 +931,7 @@ func MilestoneByTitle(client *Client, repo ghrepo.Interface, title string) (*Rep
 	return nil, fmt.Errorf("no milestone found with title %q", title)
 }
 
-func MilestoneByNumber(client *Client, repo ghrepo.Interface, number int) (*RepoMilestone, error) {
+func MilestoneByNumber(client *Client, repo ghrepo.Interface, number int32) (*RepoMilestone, error) {
 	var query struct {
 		Repository struct {
 			Milestone *RepoMilestone `graphql:"milestone(number: $number)"`
@@ -857,4 +955,13 @@ func MilestoneByNumber(client *Client, repo ghrepo.Interface, number int) (*Repo
 	}
 
 	return query.Repository.Milestone, nil
+}
+
+func ProjectNamesToPaths(client *Client, repo ghrepo.Interface, projectNames []string) ([]string, error) {
+	var paths []string
+	projects, err := RepoAndOrgProjects(client, repo)
+	if err != nil {
+		return paths, err
+	}
+	return ProjectsToPaths(projects, projectNames)
 }

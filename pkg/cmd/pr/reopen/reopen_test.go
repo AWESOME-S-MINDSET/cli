@@ -14,6 +14,7 @@ import (
 	"github.com/cli/cli/pkg/iostreams"
 	"github.com/cli/cli/test"
 	"github.com/google/shlex"
+	"github.com/stretchr/testify/assert"
 )
 
 func runCommand(rt http.RoundTripper, isTTY bool, cli string) (*test.CmdOut, error) {
@@ -58,15 +59,55 @@ func TestPRReopen(t *testing.T) {
 	http := &httpmock.Registry{}
 	defer http.Verify(t)
 
-	http.StubResponse(200, bytes.NewBufferString(`
-	{ "data": { "repository": {
-		"pullRequest": { "number": 666, "title": "The title of the PR", "closed": true}
-	} } }
-	`))
-
-	http.StubResponse(200, bytes.NewBufferString(`{"id": "THE-ID"}`))
+	http.Register(
+		httpmock.GraphQL(`query PullRequestByNumber\b`),
+		httpmock.StringResponse(`
+			{ "data": { "repository": {
+				"pullRequest": { "id": "THE-ID", "number": 666, "title": "The title of the PR", "state": "CLOSED" }
+			} } }`),
+	)
+	http.Register(
+		httpmock.GraphQL(`mutation PullRequestReopen\b`),
+		httpmock.GraphQLMutation(`{"id": "THE-ID"}`,
+			func(inputs map[string]interface{}) {
+				assert.Equal(t, inputs["pullRequestId"], "THE-ID")
+			}),
+	)
 
 	output, err := runCommand(http, true, "666")
+	if err != nil {
+		t.Fatalf("error running command `pr reopen`: %v", err)
+	}
+
+	r := regexp.MustCompile(`Reopened pull request #666 \(The title of the PR\)`)
+
+	if !r.MatchString(output.Stderr()) {
+		t.Fatalf("output did not match regexp /%s/\n> output\n%q\n", r, output.Stderr())
+	}
+}
+
+func TestPRReopen_BranchArg(t *testing.T) {
+	http := &httpmock.Registry{}
+	defer http.Verify(t)
+
+	http.Register(
+		httpmock.GraphQL(`query PullRequestForBranch\b`),
+		httpmock.StringResponse(`
+			{ "data": { "repository": { "pullRequests": {
+				"nodes": [
+					{ "id": "THE-ID", "number": 666, "title": "The title of the PR", "headRefName": "fix-bug", "state": "CLOSED" }
+				]
+			} } } }`),
+	)
+	http.Register(
+		httpmock.GraphQL(`mutation PullRequestReopen\b`),
+		httpmock.GraphQLMutation(`{"id": "THE-ID"}`,
+			func(inputs map[string]interface{}) {
+				assert.Equal(t, inputs["pullRequestId"], "THE-ID")
+			}),
+	)
+
+	output, err := runCommand(http, true, "fix-bug")
 	if err != nil {
 		t.Fatalf("error running command `pr reopen`: %v", err)
 	}
@@ -82,11 +123,13 @@ func TestPRReopen_alreadyOpen(t *testing.T) {
 	http := &httpmock.Registry{}
 	defer http.Verify(t)
 
-	http.StubResponse(200, bytes.NewBufferString(`
-	{ "data": { "repository": {
-		"pullRequest": { "number": 666,  "title": "The title of the PR", "closed": false}
-	} } }
-	`))
+	http.Register(
+		httpmock.GraphQL(`query PullRequestByNumber\b`),
+		httpmock.StringResponse(`
+			{ "data": { "repository": {
+				"pullRequest": { "number": 666,  "title": "The title of the PR", "state": "OPEN" }
+			} } }`),
+	)
 
 	output, err := runCommand(http, true, "666")
 	if err != nil {
@@ -104,11 +147,13 @@ func TestPRReopen_alreadyMerged(t *testing.T) {
 	http := &httpmock.Registry{}
 	defer http.Verify(t)
 
-	http.StubResponse(200, bytes.NewBufferString(`
-	{ "data": { "repository": {
-		"pullRequest": { "number": 666, "title": "The title of the PR", "closed": true, "state": "MERGED"}
-	} } }
-	`))
+	http.Register(
+		httpmock.GraphQL(`query PullRequestByNumber\b`),
+		httpmock.StringResponse(`
+			{ "data": { "repository": {
+				"pullRequest": { "number": 666, "title": "The title of the PR", "state": "MERGED"}
+			} } }`),
+	)
 
 	output, err := runCommand(http, true, "666")
 	if err == nil {

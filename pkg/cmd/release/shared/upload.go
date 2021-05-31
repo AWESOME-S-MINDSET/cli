@@ -62,6 +62,8 @@ func typeForFilename(fn string) string {
 		return "application/zip"
 	case ".js":
 		return "application/javascript"
+	case ".tar":
+		return "application/x-tar"
 	case ".tgz", ".tar.gz":
 		return "application/x-gtar"
 	case ".bz2":
@@ -168,6 +170,7 @@ func uploadAsset(httpClient *http.Client, uploadURL string, asset AssetForUpload
 	}
 	req.ContentLength = asset.Size
 	req.Header.Set("Content-Type", asset.MIMEType)
+	req.GetBody = asset.Open
 
 	resp, err := httpClient.Do(req)
 	if err != nil {

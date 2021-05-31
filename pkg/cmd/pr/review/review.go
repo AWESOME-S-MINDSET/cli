@@ -14,9 +14,9 @@ import (
 	"github.com/cli/cli/pkg/cmd/pr/shared"
 	"github.com/cli/cli/pkg/cmdutil"
 	"github.com/cli/cli/pkg/iostreams"
+	"github.com/cli/cli/pkg/markdown"
 	"github.com/cli/cli/pkg/prompt"
 	"github.com/cli/cli/pkg/surveyext"
-	"github.com/cli/cli/utils"
 	"github.com/spf13/cobra"
 )
 
@@ -49,6 +49,8 @@ func NewCmdReview(f *cmdutil.Factory, runF func(*ReviewOptions) error) *cobra.Co
 		flagComment        bool
 	)
 
+	var bodyFile string
+
 	cmd := &cobra.Command{
 		Use:   "review [<number> | <url> | <branch>]",
 		Short: "Add a review to a pull request",
@@ -60,13 +62,13 @@ func NewCmdReview(f *cmdutil.Factory, runF func(*ReviewOptions) error) *cobra.Co
 		Example: heredoc.Doc(`
 			# approve the pull request of the current branch
 			$ gh pr review --approve
-			
+
 			# leave a review comment for the current branch
 			$ gh pr review --comment -b "interesting"
-			
+
 			# add a review for a specific pull request
 			$ gh pr review 123
-			
+
 			# request changes on a specific pull request
 			$ gh pr review 123 -r -b "needs more ASCII art"
 		`),
@@ -81,6 +83,24 @@ func NewCmdReview(f *cmdutil.Factory, runF func(*ReviewOptions) error) *cobra.Co
 
 			if len(args) > 0 {
 				opts.SelectorArg = args[0]
+			}
+
+			bodyProvided := cmd.Flags().Changed("body")
+			bodyFileProvided := bodyFile != ""
+
+			if err := cmdutil.MutuallyExclusive(
+				"specify only one of `--body` or `--body-file`",
+				bodyProvided,
+				bodyFileProvided,
+			); err != nil {
+				return err
+			}
+			if bodyFileProvided {
+				b, err := cmdutil.ReadFile(bodyFile, opts.IO.In)
+				if err != nil {
+					return err
+				}
+				opts.Body = string(b)
 			}
 
 			found := 0
@@ -125,6 +145,7 @@ func NewCmdReview(f *cmdutil.Factory, runF func(*ReviewOptions) error) *cobra.Co
 	cmd.Flags().BoolVarP(&flagRequestChanges, "request-changes", "r", false, "Request changes on a pull request")
 	cmd.Flags().BoolVarP(&flagComment, "comment", "c", false, "Comment on a pull request")
 	cmd.Flags().StringVarP(&opts.Body, "body", "b", "", "Specify the body of a review")
+	cmd.Flags().StringVarP(&bodyFile, "body-file", "F", "", "Read body text from `file`")
 
 	return cmd
 }
@@ -171,13 +192,15 @@ func reviewRun(opts *ReviewOptions) error {
 		return nil
 	}
 
+	cs := opts.IO.ColorScheme()
+
 	switch reviewData.State {
 	case api.ReviewComment:
-		fmt.Fprintf(opts.IO.ErrOut, "%s Reviewed pull request #%d\n", utils.Gray("-"), pr.Number)
+		fmt.Fprintf(opts.IO.ErrOut, "%s Reviewed pull request #%d\n", cs.Gray("-"), pr.Number)
 	case api.ReviewApprove:
-		fmt.Fprintf(opts.IO.ErrOut, "%s Approved pull request #%d\n", utils.Green("✓"), pr.Number)
+		fmt.Fprintf(opts.IO.ErrOut, "%s Approved pull request #%d\n", cs.SuccessIcon(), pr.Number)
 	case api.ReviewRequestChanges:
-		fmt.Fprintf(opts.IO.ErrOut, "%s Requested changes to pull request #%d\n", utils.Red("+"), pr.Number)
+		fmt.Fprintf(opts.IO.ErrOut, "%s Requested changes to pull request #%d\n", cs.Red("+"), pr.Number)
 	}
 
 	return nil
@@ -252,7 +275,8 @@ func reviewSurvey(io *iostreams.IOStreams, editorCommand string) (*api.PullReque
 	}
 
 	if len(bodyAnswers.Body) > 0 {
-		renderedBody, err := utils.RenderMarkdown(bodyAnswers.Body)
+		style := markdown.GetStyle(io.DetectTerminalTheme())
+		renderedBody, err := markdown.Render(bodyAnswers.Body, style)
 		if err != nil {
 			return nil, err
 		}

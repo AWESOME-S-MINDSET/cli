@@ -3,10 +3,11 @@ package view
 import (
 	"errors"
 	"fmt"
-	"io"
 	"net/http"
 	"sort"
+	"strconv"
 	"strings"
+	"sync"
 
 	"github.com/MakeNowJust/heredoc"
 	"github.com/cli/cli/api"
@@ -16,20 +17,29 @@ import (
 	"github.com/cli/cli/pkg/cmd/pr/shared"
 	"github.com/cli/cli/pkg/cmdutil"
 	"github.com/cli/cli/pkg/iostreams"
+	"github.com/cli/cli/pkg/markdown"
 	"github.com/cli/cli/utils"
 	"github.com/spf13/cobra"
 )
+
+type browser interface {
+	Browse(string) error
+}
 
 type ViewOptions struct {
 	HttpClient func() (*http.Client, error)
 	Config     func() (config.Config, error)
 	IO         *iostreams.IOStreams
+	Browser    browser
 	BaseRepo   func() (ghrepo.Interface, error)
 	Remotes    func() (context.Remotes, error)
 	Branch     func() (string, error)
 
+	Exporter cmdutil.Exporter
+
 	SelectorArg string
 	BrowserMode bool
+	Comments    bool
 }
 
 func NewCmdView(f *cmdutil.Factory, runF func(*ViewOptions) error) *cobra.Command {
@@ -39,6 +49,7 @@ func NewCmdView(f *cmdutil.Factory, runF func(*ViewOptions) error) *cobra.Comman
 		Config:     f.Config,
 		Remotes:    f.Remotes,
 		Branch:     f.Branch,
+		Browser:    f.Browser,
 	}
 
 	cmd := &cobra.Command{
@@ -51,7 +62,7 @@ func NewCmdView(f *cmdutil.Factory, runF func(*ViewOptions) error) *cobra.Comman
 			is displayed.
 
 			With '--web', open the pull request in a web browser instead.
-    	`),
+		`),
 		Args: cobra.MaximumNArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			// support `-R, --repo` override
@@ -73,40 +84,60 @@ func NewCmdView(f *cmdutil.Factory, runF func(*ViewOptions) error) *cobra.Comman
 	}
 
 	cmd.Flags().BoolVarP(&opts.BrowserMode, "web", "w", false, "Open a pull request in the browser")
+	cmd.Flags().BoolVarP(&opts.Comments, "comments", "c", false, "View pull request comments")
+	cmdutil.AddJSONFlags(cmd, &opts.Exporter, api.PullRequestFields)
 
 	return cmd
 }
 
 func viewRun(opts *ViewOptions) error {
-	httpClient, err := opts.HttpClient()
-	if err != nil {
-		return err
-	}
-	apiClient := api.NewClientFromHTTP(httpClient)
-
-	pr, _, err := shared.PRFromArgs(apiClient, opts.BaseRepo, opts.Branch, opts.Remotes, opts.SelectorArg)
+	opts.IO.StartProgressIndicator()
+	pr, err := retrievePullRequest(opts)
+	opts.IO.StopProgressIndicator()
 	if err != nil {
 		return err
 	}
 
-	openURL := pr.URL
 	connectedToTerminal := opts.IO.IsStdoutTTY() && opts.IO.IsStderrTTY()
 
 	if opts.BrowserMode {
+		openURL := pr.URL
 		if connectedToTerminal {
 			fmt.Fprintf(opts.IO.ErrOut, "Opening %s in your browser.\n", utils.DisplayURL(openURL))
 		}
-		return utils.OpenInBrowser(openURL)
+		return opts.Browser.Browse(openURL)
+	}
+
+	opts.IO.DetectTerminalTheme()
+
+	err = opts.IO.StartPager()
+	if err != nil {
+		return err
+	}
+	defer opts.IO.StopPager()
+
+	if opts.Exporter != nil {
+		exportPR := pr.ExportData(opts.Exporter.Fields())
+		return opts.Exporter.Write(opts.IO.Out, exportPR, opts.IO.ColorEnabled())
 	}
 
 	if connectedToTerminal {
-		return printHumanPrPreview(opts.IO.Out, pr)
+		return printHumanPrPreview(opts, pr)
 	}
-	return printRawPrPreview(opts.IO.Out, pr)
+
+	if opts.Comments {
+		fmt.Fprint(opts.IO.Out, shared.RawCommentList(pr.Comments, pr.DisplayableReviews()))
+		return nil
+	}
+
+	return printRawPrPreview(opts.IO, pr)
 }
 
-func printRawPrPreview(out io.Writer, pr *api.PullRequest) error {
-	reviewers := prReviewerList(*pr)
+func printRawPrPreview(io *iostreams.IOStreams, pr *api.PullRequest) error {
+	out := io.Out
+	cs := io.ColorScheme()
+
+	reviewers := prReviewerList(*pr, cs)
 	assignees := prAssigneeList(*pr)
 	labels := prLabelList(*pr)
 	projects := prProjectList(*pr)
@@ -121,6 +152,8 @@ func printRawPrPreview(out io.Writer, pr *api.PullRequest) error {
 	fmt.Fprintf(out, "milestone:\t%s\n", pr.Milestone.Title)
 	fmt.Fprintf(out, "number:\t%d\n", pr.Number)
 	fmt.Fprintf(out, "url:\t%s\n", pr.URL)
+	fmt.Fprintf(out, "additions:\t%s\n", cs.Green(strconv.Itoa(pr.Additions)))
+	fmt.Fprintf(out, "deletions:\t%s\n", cs.Red(strconv.Itoa(pr.Deletions)))
 
 	fmt.Fprintln(out, "--")
 	fmt.Fprintln(out, pr.Body)
@@ -128,58 +161,81 @@ func printRawPrPreview(out io.Writer, pr *api.PullRequest) error {
 	return nil
 }
 
-func printHumanPrPreview(out io.Writer, pr *api.PullRequest) error {
+func printHumanPrPreview(opts *ViewOptions, pr *api.PullRequest) error {
+	out := opts.IO.Out
+	cs := opts.IO.ColorScheme()
+
 	// Header (Title and State)
-	fmt.Fprintln(out, utils.Bold(pr.Title))
-	fmt.Fprintf(out, "%s", shared.StateTitleWithColor(*pr))
-	fmt.Fprintln(out, utils.Gray(fmt.Sprintf(
-		" • %s wants to merge %s into %s from %s",
+	fmt.Fprintln(out, cs.Bold(pr.Title))
+	fmt.Fprintf(out,
+		"%s • %s wants to merge %s into %s from %s • %s %s \n",
+		shared.StateTitleWithColor(cs, *pr),
 		pr.Author.Login,
 		utils.Pluralize(pr.Commits.TotalCount, "commit"),
 		pr.BaseRefName,
 		pr.HeadRefName,
-	)))
-	fmt.Fprintln(out)
+		cs.Green("+"+strconv.Itoa(pr.Additions)),
+		cs.Red("-"+strconv.Itoa(pr.Deletions)),
+	)
+
+	// Reactions
+	if reactions := shared.ReactionGroupList(pr.ReactionGroups); reactions != "" {
+		fmt.Fprint(out, reactions)
+		fmt.Fprintln(out)
+	}
 
 	// Metadata
-	if reviewers := prReviewerList(*pr); reviewers != "" {
-		fmt.Fprint(out, utils.Bold("Reviewers: "))
+	if reviewers := prReviewerList(*pr, cs); reviewers != "" {
+		fmt.Fprint(out, cs.Bold("Reviewers: "))
 		fmt.Fprintln(out, reviewers)
 	}
 	if assignees := prAssigneeList(*pr); assignees != "" {
-		fmt.Fprint(out, utils.Bold("Assignees: "))
+		fmt.Fprint(out, cs.Bold("Assignees: "))
 		fmt.Fprintln(out, assignees)
 	}
 	if labels := prLabelList(*pr); labels != "" {
-		fmt.Fprint(out, utils.Bold("Labels: "))
+		fmt.Fprint(out, cs.Bold("Labels: "))
 		fmt.Fprintln(out, labels)
 	}
 	if projects := prProjectList(*pr); projects != "" {
-		fmt.Fprint(out, utils.Bold("Projects: "))
+		fmt.Fprint(out, cs.Bold("Projects: "))
 		fmt.Fprintln(out, projects)
 	}
 	if pr.Milestone.Title != "" {
-		fmt.Fprint(out, utils.Bold("Milestone: "))
+		fmt.Fprint(out, cs.Bold("Milestone: "))
 		fmt.Fprintln(out, pr.Milestone.Title)
 	}
 
 	// Body
-	if pr.Body != "" {
-		fmt.Fprintln(out)
-		md, err := utils.RenderMarkdown(pr.Body)
+	var md string
+	var err error
+	if pr.Body == "" {
+		md = fmt.Sprintf("\n  %s\n\n", cs.Gray("No description provided"))
+	} else {
+		style := markdown.GetStyle(opts.IO.TerminalTheme())
+		md, err = markdown.Render(pr.Body, style)
 		if err != nil {
 			return err
 		}
-		fmt.Fprintln(out, md)
 	}
-	fmt.Fprintln(out)
+	fmt.Fprintf(out, "\n%s\n", md)
+
+	// Reviews and Comments
+	if pr.Comments.TotalCount > 0 || pr.Reviews.TotalCount > 0 {
+		preview := !opts.Comments
+		comments, err := shared.CommentList(opts.IO, pr.Comments, pr.DisplayableReviews(), preview)
+		if err != nil {
+			return err
+		}
+		fmt.Fprint(out, comments)
+	}
 
 	// Footer
-	fmt.Fprintf(out, utils.Gray("View this pull request on GitHub: %s\n"), pr.URL)
+	fmt.Fprintf(out, cs.Gray("View this pull request on GitHub: %s\n"), pr.URL)
+
 	return nil
 }
 
-// Ref. https://developer.github.com/v4/enum/pullrequestreviewstate/
 const (
 	requestedReviewState        = "REQUESTED" // This is our own state for review request
 	approvedReviewState         = "APPROVED"
@@ -194,43 +250,39 @@ type reviewerState struct {
 	State string
 }
 
-// colorFuncForReviewerState returns a color function for a reviewer state
-func colorFuncForReviewerState(state string) func(string) string {
-	switch state {
-	case requestedReviewState:
-		return utils.Yellow
-	case approvedReviewState:
-		return utils.Green
-	case changesRequestedReviewState:
-		return utils.Red
-	case commentedReviewState:
-		return func(str string) string { return str } // Do nothing
-	default:
-		return nil
-	}
-}
-
 // formattedReviewerState formats a reviewerState with state color
-func formattedReviewerState(reviewer *reviewerState) string {
+func formattedReviewerState(cs *iostreams.ColorScheme, reviewer *reviewerState) string {
 	state := reviewer.State
 	if state == dismissedReviewState {
-		// Show "DISMISSED" review as "COMMENTED", since "dimissed" only makes
+		// Show "DISMISSED" review as "COMMENTED", since "dismissed" only makes
 		// sense when displayed in an events timeline but not in the final tally.
 		state = commentedReviewState
 	}
-	stateColorFunc := colorFuncForReviewerState(state)
-	return fmt.Sprintf("%s (%s)", reviewer.Name, stateColorFunc(strings.ReplaceAll(strings.Title(strings.ToLower(state)), "_", " ")))
+
+	var colorFunc func(string) string
+	switch state {
+	case requestedReviewState:
+		colorFunc = cs.Yellow
+	case approvedReviewState:
+		colorFunc = cs.Green
+	case changesRequestedReviewState:
+		colorFunc = cs.Red
+	default:
+		colorFunc = func(str string) string { return str } // Do nothing
+	}
+
+	return fmt.Sprintf("%s (%s)", reviewer.Name, colorFunc(strings.ReplaceAll(strings.Title(strings.ToLower(state)), "_", " ")))
 }
 
 // prReviewerList generates a reviewer list with their last state
-func prReviewerList(pr api.PullRequest) string {
+func prReviewerList(pr api.PullRequest, cs *iostreams.ColorScheme) string {
 	reviewerStates := parseReviewers(pr)
 	reviewers := make([]string, 0, len(reviewerStates))
 
 	sortReviewerStates(reviewerStates)
 
 	for _, reviewer := range reviewerStates {
-		reviewers = append(reviewers, formattedReviewerState(reviewer))
+		reviewers = append(reviewers, formattedReviewerState(cs, reviewer))
 	}
 
 	reviewerList := strings.Join(reviewers, ", ")
@@ -238,7 +290,6 @@ func prReviewerList(pr api.PullRequest) string {
 	return reviewerList
 }
 
-// Ref. https://developer.github.com/v4/union/requestedreviewer/
 const teamTypeName = "Team"
 
 const ghostName = "ghost"
@@ -361,4 +412,52 @@ func prStateWithDraft(pr *api.PullRequest) string {
 	}
 
 	return pr.State
+}
+
+func retrievePullRequest(opts *ViewOptions) (*api.PullRequest, error) {
+	httpClient, err := opts.HttpClient()
+	if err != nil {
+		return nil, err
+	}
+
+	apiClient := api.NewClientFromHTTP(httpClient)
+
+	pr, repo, err := shared.PRFromArgs(apiClient, opts.BaseRepo, opts.Branch, opts.Remotes, opts.SelectorArg)
+	if err != nil {
+		return nil, err
+	}
+
+	if opts.BrowserMode {
+		return pr, nil
+	}
+
+	var errp, errc error
+	var wg sync.WaitGroup
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		var reviews *api.PullRequestReviews
+		reviews, errp = api.ReviewsForPullRequest(apiClient, repo, pr)
+		pr.Reviews = *reviews
+	}()
+
+	if opts.Comments {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			var comments *api.Comments
+			comments, errc = api.CommentsForPullRequest(apiClient, repo, pr)
+			pr.Comments = *comments
+		}()
+	}
+
+	wg.Wait()
+
+	if errp != nil {
+		err = errp
+	}
+	if errc != nil {
+		err = errc
+	}
+	return pr, err
 }

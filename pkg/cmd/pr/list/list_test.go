@@ -4,12 +4,10 @@ import (
 	"bytes"
 	"io/ioutil"
 	"net/http"
-	"os/exec"
-	"reflect"
-	"regexp"
 	"strings"
 	"testing"
 
+	"github.com/MakeNowJust/heredoc"
 	"github.com/cli/cli/internal/ghrepo"
 	"github.com/cli/cli/internal/run"
 	"github.com/cli/cli/pkg/cmdutil"
@@ -20,20 +18,16 @@ import (
 	"github.com/stretchr/testify/assert"
 )
 
-func eq(t *testing.T, got interface{}, expected interface{}) {
-	t.Helper()
-	if !reflect.DeepEqual(got, expected) {
-		t.Errorf("expected: %v, got: %v", expected, got)
-	}
-}
 func runCommand(rt http.RoundTripper, isTTY bool, cli string) (*test.CmdOut, error) {
 	io, _, stdout, stderr := iostreams.Test()
 	io.SetStdoutTTY(isTTY)
 	io.SetStdinTTY(isTTY)
 	io.SetStderrTTY(isTTY)
 
+	browser := &cmdutil.TestBrowser{}
 	factory := &cmdutil.Factory{
 		IOStreams: io,
+		Browser:   browser,
 		HttpClient: func() (*http.Client, error) {
 			return &http.Client{Transport: rt}, nil
 		},
@@ -56,8 +50,9 @@ func runCommand(rt http.RoundTripper, isTTY bool, cli string) (*test.CmdOut, err
 
 	_, err = cmd.ExecuteC()
 	return &test.CmdOut{
-		OutBuf: stdout,
-		ErrBuf: stderr,
+		OutBuf:     stdout,
+		ErrBuf:     stderr,
+		BrowsedURL: browser.BrowsedURL(),
 	}, err
 }
 
@@ -76,23 +71,15 @@ func TestPRList(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	assert.Equal(t, `
-Showing 3 of 3 open pull requests in OWNER/REPO
+	assert.Equal(t, heredoc.Doc(`
 
-`, output.Stderr())
+		Showing 3 of 3 open pull requests in OWNER/REPO
 
-	lines := strings.Split(output.String(), "\n")
-	res := []*regexp.Regexp{
-		regexp.MustCompile(`#32.*New feature.*feature`),
-		regexp.MustCompile(`#29.*Fixed bad bug.*hubot:bug-fix`),
-		regexp.MustCompile(`#28.*Improve documentation.*docs`),
-	}
-
-	for i, r := range res {
-		if !r.MatchString(lines[i]) {
-			t.Errorf("%s did not match %s", lines[i], r)
-		}
-	}
+		#32  New feature            feature
+		#29  Fixed bad bug          hubot:bug-fix
+		#28  Improve documentation  docs
+	`), output.String())
+	assert.Equal(t, ``, output.Stderr())
 }
 
 func TestPRList_nontty(t *testing.T) {
@@ -122,19 +109,18 @@ func TestPRList_filtering(t *testing.T) {
 		httpmock.GraphQL(`query PullRequestList\b`),
 		httpmock.GraphQLQuery(`{}`, func(_ string, params map[string]interface{}) {
 			assert.Equal(t, []interface{}{"OPEN", "CLOSED", "MERGED"}, params["state"].([]interface{}))
-			assert.Equal(t, []interface{}{"one", "two", "three"}, params["labels"].([]interface{}))
 		}))
 
-	output, err := runCommand(http, true, `-s all -l one,two -l three`)
+	output, err := runCommand(http, true, `-s all`)
 	if err != nil {
 		t.Fatal(err)
 	}
 
-	eq(t, output.String(), "")
-	eq(t, output.Stderr(), `
+	assert.Equal(t, "", output.Stderr())
+	assert.Equal(t, `
 No pull requests match your search in OWNER/REPO
 
-`)
+`, output.String())
 }
 
 func TestPRList_filteringRemoveDuplicate(t *testing.T) {
@@ -145,24 +131,17 @@ func TestPRList_filteringRemoveDuplicate(t *testing.T) {
 		httpmock.GraphQL(`query PullRequestList\b`),
 		httpmock.FileResponse("./fixtures/prListWithDuplicates.json"))
 
-	output, err := runCommand(http, true, "-l one,two")
+	output, err := runCommand(http, true, "")
 	if err != nil {
 		t.Fatal(err)
 	}
 
-	lines := strings.Split(output.String(), "\n")
-
-	res := []*regexp.Regexp{
-		regexp.MustCompile(`#32.*New feature.*feature`),
-		regexp.MustCompile(`#29.*Fixed bad bug.*hubot:bug-fix`),
-		regexp.MustCompile(`#28.*Improve documentation.*docs`),
+	out := output.String()
+	idx := strings.Index(out, "New feature")
+	if idx < 0 {
+		t.Fatalf("text %q not found in %q", "New feature", out)
 	}
-
-	for i, r := range res {
-		if !r.MatchString(lines[i]) {
-			t.Errorf("%s did not match %s", lines[i], r)
-		}
-	}
+	assert.Equal(t, idx, strings.LastIndex(out, "New feature"))
 }
 
 func TestPRList_filteringClosed(t *testing.T) {
@@ -186,9 +165,9 @@ func TestPRList_filteringAssignee(t *testing.T) {
 	defer http.Verify(t)
 
 	http.Register(
-		httpmock.GraphQL(`query PullRequestList\b`),
+		httpmock.GraphQL(`query PullRequestSearch\b`),
 		httpmock.GraphQLQuery(`{}`, func(_ string, params map[string]interface{}) {
-			assert.Equal(t, `repo:OWNER/REPO assignee:hubot is:pr sort:created-desc is:merged label:"needs tests" base:"develop"`, params["q"].(string))
+			assert.Equal(t, `repo:OWNER/REPO is:pr is:merged assignee:hubot label:"needs tests" base:develop`, params["q"].(string))
 		}))
 
 	_, err := runCommand(http, true, `-s merged -l "needs tests" -a hubot -B develop`)
@@ -221,26 +200,15 @@ func TestPRList_web(t *testing.T) {
 	http := initFakeHTTP()
 	defer http.Verify(t)
 
-	var seenCmd *exec.Cmd
-	restoreCmd := run.SetPrepareCmd(func(cmd *exec.Cmd) run.Runnable {
-		seenCmd = cmd
-		return &test.OutputStub{}
-	})
-	defer restoreCmd()
+	_, cmdTeardown := run.Stub()
+	defer cmdTeardown(t)
 
 	output, err := runCommand(http, true, "--web -a peter -l bug -l docs -L 10 -s merged -B trunk")
 	if err != nil {
 		t.Errorf("error running command `pr list` with `--web` flag: %v", err)
 	}
 
-	expectedURL := "https://github.com/OWNER/REPO/pulls?q=is%3Apr+is%3Amerged+assignee%3Apeter+label%3Abug+label%3Adocs+base%3Atrunk"
-
-	eq(t, output.String(), "")
-	eq(t, output.Stderr(), "Opening github.com/OWNER/REPO/pulls in your browser.\n")
-
-	if seenCmd == nil {
-		t.Fatal("expected a command to run")
-	}
-	url := seenCmd.Args[len(seenCmd.Args)-1]
-	eq(t, url, expectedURL)
+	assert.Equal(t, "", output.String())
+	assert.Equal(t, "Opening github.com/OWNER/REPO/pulls in your browser.\n", output.Stderr())
+	assert.Equal(t, "https://github.com/OWNER/REPO/pulls?q=is%3Apr+is%3Amerged+assignee%3Apeter+label%3Abug+label%3Adocs+base%3Atrunk", output.BrowsedURL)
 }

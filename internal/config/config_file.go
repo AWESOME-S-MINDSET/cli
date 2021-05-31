@@ -7,27 +7,92 @@ import (
 	"io/ioutil"
 	"os"
 	"path"
+	"path/filepath"
 	"syscall"
 
 	"github.com/mitchellh/go-homedir"
 	"gopkg.in/yaml.v3"
 )
 
+const (
+	GH_CONFIG_DIR = "GH_CONFIG_DIR"
+)
+
 func ConfigDir() string {
-	dir, _ := homedir.Expand("~/.config/gh")
-	return dir
+	if v := os.Getenv(GH_CONFIG_DIR); v != "" {
+		return v
+	}
+
+	homeDir, _ := homeDirAutoMigrate()
+	return homeDir
 }
 
 func ConfigFile() string {
-	return path.Join(ConfigDir(), "config.yml")
+	return filepath.Join(ConfigDir(), "config.yml")
 }
 
-func hostsConfigFile(filename string) string {
-	return path.Join(path.Dir(filename), "hosts.yml")
+func HostsConfigFile() string {
+	return filepath.Join(ConfigDir(), "hosts.yml")
 }
 
 func ParseDefaultConfig() (Config, error) {
-	return ParseConfig(ConfigFile())
+	return parseConfig(ConfigFile())
+}
+
+func HomeDirPath(subdir string) (string, error) {
+	homeDir, err := os.UserHomeDir()
+	if err != nil {
+		// TODO: remove go-homedir fallback in GitHub CLI v2
+		if legacyDir, err := homedir.Dir(); err == nil {
+			return filepath.Join(legacyDir, subdir), nil
+		}
+		return "", err
+	}
+
+	newPath := filepath.Join(homeDir, subdir)
+	if s, err := os.Stat(newPath); err == nil && s.IsDir() {
+		return newPath, nil
+	}
+
+	// TODO: remove go-homedir fallback in GitHub CLI v2
+	if legacyDir, err := homedir.Dir(); err == nil {
+		legacyPath := filepath.Join(legacyDir, subdir)
+		if s, err := os.Stat(legacyPath); err == nil && s.IsDir() {
+			return legacyPath, nil
+		}
+	}
+
+	return newPath, nil
+}
+
+// Looks up the `~/.config/gh` directory with backwards-compatibility with go-homedir and auto-migration
+// when an old homedir location was found.
+func homeDirAutoMigrate() (string, error) {
+	homeDir, err := os.UserHomeDir()
+	if err != nil {
+		// TODO: remove go-homedir fallback in GitHub CLI v2
+		if legacyDir, err := homedir.Dir(); err == nil {
+			return filepath.Join(legacyDir, ".config", "gh"), nil
+		}
+		return "", err
+	}
+
+	newPath := filepath.Join(homeDir, ".config", "gh")
+	_, newPathErr := os.Stat(newPath)
+	if newPathErr == nil || !os.IsNotExist(err) {
+		return newPath, newPathErr
+	}
+
+	// TODO: remove go-homedir fallback in GitHub CLI v2
+	if legacyDir, err := homedir.Dir(); err == nil {
+		legacyPath := filepath.Join(legacyDir, ".config", "gh")
+		if s, err := os.Stat(legacyPath); err == nil && s.IsDir() {
+			_ = os.MkdirAll(filepath.Dir(newPath), 0755)
+			return newPath, os.Rename(legacyPath, newPath)
+		}
+	}
+
+	return newPath, nil
 }
 
 var ReadConfigFile = func(filename string) ([]byte, error) {
@@ -144,7 +209,7 @@ func migrateConfig(filename string) error {
 	return cfg.Write()
 }
 
-func ParseConfig(filename string) (Config, error) {
+func parseConfig(filename string) (Config, error) {
 	_, root, err := parseConfigFile(filename)
 	if err != nil {
 		if os.IsNotExist(err) {
@@ -165,7 +230,7 @@ func ParseConfig(filename string) (Config, error) {
 			return nil, fmt.Errorf("failed to reparse migrated config: %w", err)
 		}
 	} else {
-		if _, hostsRoot, err := parseConfigFile(hostsConfigFile(filename)); err == nil {
+		if _, hostsRoot, err := parseConfigFile(HostsConfigFile()); err == nil {
 			if len(hostsRoot.Content[0].Content) > 0 {
 				newContent := []*yaml.Node{
 					{Value: "hosts"},

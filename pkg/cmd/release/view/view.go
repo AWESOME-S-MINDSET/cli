@@ -12,14 +12,20 @@ import (
 	"github.com/cli/cli/pkg/cmd/release/shared"
 	"github.com/cli/cli/pkg/cmdutil"
 	"github.com/cli/cli/pkg/iostreams"
+	"github.com/cli/cli/pkg/markdown"
 	"github.com/cli/cli/utils"
 	"github.com/spf13/cobra"
 )
+
+type browser interface {
+	Browse(string) error
+}
 
 type ViewOptions struct {
 	HttpClient func() (*http.Client, error)
 	IO         *iostreams.IOStreams
 	BaseRepo   func() (ghrepo.Interface, error)
+	Browser    browser
 
 	TagName string
 	WebMode bool
@@ -29,6 +35,7 @@ func NewCmdView(f *cmdutil.Factory, runF func(*ViewOptions) error) *cobra.Comman
 	opts := &ViewOptions{
 		IO:         f.IOStreams,
 		HttpClient: f.HttpClient,
+		Browser:    f.Browser,
 	}
 
 	cmd := &cobra.Command{
@@ -90,7 +97,7 @@ func viewRun(opts *ViewOptions) error {
 		if opts.IO.IsStdoutTTY() {
 			fmt.Fprintf(opts.IO.ErrOut, "Opening %s in your browser.\n", utils.DisplayURL(release.HTMLURL))
 		}
-		return utils.OpenInBrowser(release.HTMLURL)
+		return opts.Browser.Browse(release.HTMLURL)
 	}
 
 	if opts.IO.IsStdoutTTY() {
@@ -122,7 +129,8 @@ func renderReleaseTTY(io *iostreams.IOStreams, release *shared.Release) error {
 		fmt.Fprintf(w, "%s\n", iofmt.Gray(fmt.Sprintf("%s released this %s", release.Author.Login, utils.FuzzyAgo(time.Since(release.PublishedAt)))))
 	}
 
-	renderedDescription, err := utils.RenderMarkdown(release.Body)
+	style := markdown.GetStyle(io.DetectTerminalTheme())
+	renderedDescription, err := markdown.Render(release.Body, style)
 	if err != nil {
 		return err
 	}

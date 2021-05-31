@@ -3,7 +3,6 @@ package api
 import (
 	"bytes"
 	"encoding/json"
-	"errors"
 	"fmt"
 	"io"
 	"io/ioutil"
@@ -99,58 +98,6 @@ func ReplaceTripper(tr http.RoundTripper) ClientOption {
 	}
 }
 
-var issuedScopesWarning bool
-
-const (
-	httpOAuthAppID  = "X-Oauth-Client-Id"
-	httpOAuthScopes = "X-Oauth-Scopes"
-)
-
-// CheckScopes checks whether an OAuth scope is present in a response
-func CheckScopes(wantedScope string, cb func(string) error) ClientOption {
-	wantedCandidates := []string{wantedScope}
-	if strings.HasPrefix(wantedScope, "read:") {
-		wantedCandidates = append(wantedCandidates, "admin:"+strings.TrimPrefix(wantedScope, "read:"))
-	}
-
-	return func(tr http.RoundTripper) http.RoundTripper {
-		return &funcTripper{roundTrip: func(req *http.Request) (*http.Response, error) {
-			res, err := tr.RoundTrip(req)
-			if err != nil || res.StatusCode > 299 || issuedScopesWarning {
-				return res, err
-			}
-
-			_, hasHeader := res.Header[httpOAuthAppID]
-			if !hasHeader {
-				return res, nil
-			}
-
-			appID := res.Header.Get(httpOAuthAppID)
-			hasScopes := strings.Split(res.Header.Get(httpOAuthScopes), ",")
-
-			hasWanted := false
-		outer:
-			for _, s := range hasScopes {
-				for _, w := range wantedCandidates {
-					if w == strings.TrimSpace(s) {
-						hasWanted = true
-						break outer
-					}
-				}
-			}
-
-			if !hasWanted {
-				if err := cb(appID); err != nil {
-					return res, err
-				}
-				issuedScopesWarning = true
-			}
-
-			return res, nil
-		}}
-	}
-}
-
 type funcTripper struct {
 	roundTrip func(*http.Request) (*http.Response, error)
 }
@@ -162,6 +109,10 @@ func (tr funcTripper) RoundTrip(req *http.Request) (*http.Response, error) {
 // Client facilitates making HTTP requests to the GitHub API
 type Client struct {
 	http *http.Client
+}
+
+func (c *Client) HTTP() *http.Client {
+	return c.http
 }
 
 type graphQLResponse struct {
@@ -195,6 +146,14 @@ type HTTPError struct {
 	RequestURL  *url.URL
 	Message     string
 	OAuthScopes string
+	Errors      []HTTPErrorItem
+}
+
+type HTTPErrorItem struct {
+	Message  string
+	Resource string
+	Field    string
+	Code     string
 }
 
 func (err HTTPError) Error() string {
@@ -204,63 +163,6 @@ func (err HTTPError) Error() string {
 		return fmt.Sprintf("HTTP %d: %s (%s)", err.StatusCode, err.Message, err.RequestURL)
 	}
 	return fmt.Sprintf("HTTP %d (%s)", err.StatusCode, err.RequestURL)
-}
-
-type MissingScopesError struct {
-	error
-}
-
-func (c Client) HasMinimumScopes(hostname string) error {
-	apiEndpoint := ghinstance.RESTPrefix(hostname)
-
-	req, err := http.NewRequest("GET", apiEndpoint, nil)
-	if err != nil {
-		return err
-	}
-
-	req.Header.Set("Content-Type", "application/json; charset=utf-8")
-	res, err := c.http.Do(req)
-	if err != nil {
-		return err
-	}
-
-	defer func() {
-		// Ensure the response body is fully read and closed
-		// before we reconnect, so that we reuse the same TCPconnection.
-		_, _ = io.Copy(ioutil.Discard, res.Body)
-		res.Body.Close()
-	}()
-
-	if res.StatusCode != 200 {
-		return HandleHTTPError(res)
-	}
-
-	hasScopes := strings.Split(res.Header.Get("X-Oauth-Scopes"), ",")
-
-	search := map[string]bool{
-		"repo":      false,
-		"read:org":  false,
-		"admin:org": false,
-	}
-
-	for _, s := range hasScopes {
-		search[strings.TrimSpace(s)] = true
-	}
-
-	errorMsgs := []string{}
-	if !search["repo"] {
-		errorMsgs = append(errorMsgs, "missing required scope 'repo'")
-	}
-
-	if !search["read:org"] && !search["admin:org"] {
-		errorMsgs = append(errorMsgs, "missing required scope 'read:org'")
-	}
-
-	if len(errorMsgs) > 0 {
-		return &MissingScopesError{error: errors.New(strings.Join(errorMsgs, ";"))}
-	}
-
-	return nil
 }
 
 // GraphQL performs a GraphQL request and parses the response
@@ -292,8 +194,7 @@ func graphQLClient(h *http.Client, hostname string) *graphql.Client {
 
 // REST performs a REST request and parses the response.
 func (c Client) REST(hostname string, method string, p string, body io.Reader, data interface{}) error {
-	url := ghinstance.RESTPrefix(hostname) + p
-	req, err := http.NewRequest(method, url, body)
+	req, err := http.NewRequest(method, restURL(hostname, p), body)
 	if err != nil {
 		return err
 	}
@@ -326,6 +227,13 @@ func (c Client) REST(hostname string, method string, p string, body io.Reader, d
 	}
 
 	return nil
+}
+
+func restURL(hostname string, pathOrURL string) string {
+	if strings.HasPrefix(pathOrURL, "https://") || strings.HasPrefix(pathOrURL, "http://") {
+		return pathOrURL
+	}
+	return ghinstance.RESTPrefix(hostname) + pathOrURL
 }
 
 func handleResponse(resp *http.Response, data interface{}) error {
@@ -378,13 +286,6 @@ func HandleHTTPError(resp *http.Response) error {
 		return httpError
 	}
 
-	type errorObject struct {
-		Message  string
-		Resource string
-		Field    string
-		Code     string
-	}
-
 	messages := []string{parsedBody.Message}
 	for _, raw := range parsedBody.Errors {
 		switch raw[0] {
@@ -392,8 +293,9 @@ func HandleHTTPError(resp *http.Response) error {
 			var errString string
 			_ = json.Unmarshal(raw, &errString)
 			messages = append(messages, errString)
+			httpError.Errors = append(httpError.Errors, HTTPErrorItem{Message: errString})
 		case '{':
-			var errInfo errorObject
+			var errInfo HTTPErrorItem
 			_ = json.Unmarshal(raw, &errInfo)
 			msg := errInfo.Message
 			if errInfo.Code != "custom" {
@@ -402,6 +304,7 @@ func HandleHTTPError(resp *http.Response) error {
 			if msg != "" {
 				messages = append(messages, msg)
 			}
+			httpError.Errors = append(httpError.Errors, errInfo)
 		}
 	}
 	httpError.Message = strings.Join(messages, "\n")
